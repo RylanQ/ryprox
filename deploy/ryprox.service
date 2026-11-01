@@ -1,0 +1,44 @@
+# systemd service for RyProx.
+#
+#   sudo cp ryprox /usr/local/bin/
+#   sudo cp ryprox.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now ryprox
+#   sudo journalctl -u ryprox      # shows the first-time setup code
+
+[Unit]
+Description=RyProx reverse proxy
+Documentation=https://github.com/RylanQ/ryprox
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/ryprox serve
+Environment=RYPROX_DATA=/var/lib/ryprox
+Environment=RYPROX_ADMIN=127.0.0.1:8081
+Restart=on-failure
+RestartSec=3
+
+# Run as a throwaway user that can only bind ports 80/443 and write its data folder.
+DynamicUser=yes
+StateDirectory=ryprox
+StateDirectoryMode=0700
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

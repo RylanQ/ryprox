@@ -54,3 +54,22 @@ jobs:
       - name: govulncheck
         run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 
+
+  docker:
+    name: Docker image builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build image
+        run: docker build -t ryprox:ci .
+      - name: Image starts and reports healthy
+        run: |
+          docker run -d --name ryprox -p 127.0.0.1:18081:8081 ryprox:ci
+          for i in $(seq 1 20); do
+            if curl -fsS http://127.0.0.1:18081/healthz; then exit 0; fi
+            sleep 1
+          done
+          docker logs ryprox
+          exit 1

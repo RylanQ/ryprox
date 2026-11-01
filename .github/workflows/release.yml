@@ -1,0 +1,85 @@
+name: Release
+
+# Runs when a version tag is pushed, e.g. v0.1.0 or v0.1.0-alpha.1
+# (create one from GitHub: Releases → Draft a new release → choose a tag).
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  binaries:
+    name: Binaries and GitHub release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Test
+        run: go test -race ./...
+      - name: Build
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          COMMIT="${GITHUB_SHA::7}"
+          DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          PKG=github.com/rylanq/ryprox/internal/version
+          mkdir -p dist
+          for target in linux/amd64 linux/arm64 linux/armv7 darwin/amd64 darwin/arm64; do
+            os="${target%/*}"; arch="${target#*/}"; goarch="$arch"; goarm=""
+            if [ "$arch" = armv7 ]; then goarch=arm; goarm=7; fi
+            name="ryprox_${VERSION}_${os}_${arch}"
+            mkdir -p "build/$name"
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$goarch" GOARM="$goarm" go build -trimpath \
+              -ldflags "-s -w -X $PKG.Version=$VERSION -X $PKG.Commit=$COMMIT -X $PKG.Date=$DATE" \
+              -o "build/$name/ryprox" ./cmd/ryprox
+            cp LICENSE README.md "build/$name/"
+            tar -C build -czf "dist/$name.tar.gz" "$name"
+          done
+          cp install.sh dist/
+          (cd dist && sha256sum * > sha256sums.txt)
+          cat dist/sha256sums.txt
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          flags="--generate-notes"
+          case "$VERSION" in *-*) flags="$flags --prerelease" ;; esac
+          gh release create "$VERSION" dist/* --title "RyProx $VERSION" $flags
+
+  image:
+    name: Docker image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # push to ghcr.io
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          push: true
+          build-args: |
+            VERSION=${{ github.ref_name }}
+            COMMIT=${{ github.sha }}
+          tags: |
+            ghcr.io/rylanq/ryprox:${{ github.ref_name }}
+            ghcr.io/rylanq/ryprox:latest

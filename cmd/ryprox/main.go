@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/rylanq/ryprox/internal/config"
 	"github.com/rylanq/ryprox/internal/server"
 	"github.com/rylanq/ryprox/internal/store"
 	"github.com/rylanq/ryprox/internal/version"
@@ -44,6 +45,8 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return err
 	case "serve":
 		return serve(args[1:], stdout, stderr)
+	case "init":
+		return initCmd(args[1:], stdout, stderr)
 	case "reset-admin":
 		return resetAdmin(args[1:], stdout, stderr)
 	case "healthcheck":
@@ -62,6 +65,7 @@ func usage(w io.Writer) {
 
 Commands:
   serve         Start RyProx
+  init          Pre-configure HTTPS and the dashboard domain (used by the installer)
   reset-admin   Remove the admin account so setup runs again (if you're locked out)
   healthcheck   Exit 0 if RyProx is answering (used by Docker)
   version       Print version information
@@ -191,5 +195,52 @@ func healthcheck() error {
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("unhealthy: HTTP %d", resp.StatusCode)
 	}
+	return nil
+}
+
+// initCmd writes HTTPS settings before RyProx first starts, so the
+// installer can set everything up in one go. It can be re-run safely.
+func initCmd(args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("init", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	data := fs.String("data", env("RYPROX_DATA", "./data"), "data directory (env RYPROX_DATA)")
+	email := fs.String("acme-email", "", "email for Let's Encrypt; turns on automatic HTTPS")
+	staging := fs.Bool("acme-staging", false, "use Let's Encrypt test certificates")
+	adminDomain := fs.String("admin-domain", "", "serve the dashboard on this domain over HTTPS (needs --acme-email)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	st := store.Settings{TLSMode: store.TLSModeOff, AdminHostname: *adminDomain}
+	if *email != "" {
+		st.TLSMode, st.ACMEEmail, st.ACMEStaging = store.TLSModeACME, *email, *staging
+	}
+	if err := config.NormalizeSettings(&st); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(*data, 0o700); err != nil {
+		return err
+	}
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(*data, "ryprox.db"))
+	if err != nil {
+		return err
+	}
+	defer func() { _ = db.Close() }()
+	if err := db.SaveSettings(ctx, st); err != nil {
+		return err
+	}
+	_ = db.AddAudit(ctx, store.AuditEntry{Actor: "installer", Action: "settings.update", Detail: "set up from the command line"})
+	mode := "HTTP only"
+	if st.TLSMode == store.TLSModeACME {
+		mode = "automatic HTTPS"
+		if st.ACMEStaging {
+			mode += " with test certificates"
+		}
+	}
+	_, _ = fmt.Fprintf(stdout, "Saved: %s", mode)
+	if st.AdminHostname != "" {
+		_, _ = fmt.Fprintf(stdout, ", dashboard at https://%s", st.AdminHostname)
+	}
+	_, _ = fmt.Fprintln(stdout)
 	return nil
 }

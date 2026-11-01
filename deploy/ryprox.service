@@ -1,5 +1,6 @@
 # systemd service for RyProx.
 #
+#   sudo useradd --system --home-dir /var/lib/ryprox --shell /usr/sbin/nologin ryprox
 #   sudo cp ryprox /usr/local/bin/
 #   sudo cp ryprox.service /etc/systemd/system/
 #   sudo systemctl daemon-reload
@@ -19,8 +20,9 @@ Environment=RYPROX_ADMIN=127.0.0.1:8081
 Restart=on-failure
 RestartSec=3
 
-# Run as a throwaway user that can only bind ports 80/443 and write its data folder.
-DynamicUser=yes
+# Run as an unprivileged user that can only bind ports 80/443 and write its data folder.
+User=ryprox
+Group=ryprox
 StateDirectory=ryprox
 StateDirectoryMode=0700
 AmbientCapabilities=CAP_NET_BIND_SERVICE

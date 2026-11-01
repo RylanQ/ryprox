@@ -73,3 +73,15 @@ jobs:
           done
           docker logs ryprox
           exit 1
+
+  installer:
+    name: Installer script
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: ShellCheck
+        run: shellcheck install.sh
+      - name: Dry run
+        run: bash install.sh --dry-run --yes --docker --domain ryprox.example.com --email me@example.com

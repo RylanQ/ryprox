@@ -36,9 +36,33 @@ RyProx sends visitors from your domains (like `photos.example.com`) to services 
 
 ## 2. Install
 
-Pick one of these.
+### Quick install (recommended)
 
-### Option A: Docker Compose (recommended)
+On your server, run:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/RylanQ/ryprox/main/install.sh | sudo bash
+```
+
+It asks a few questions (dashboard domain, email for HTTPS, test or real certificates), checks that ports 80/443 are free and your DNS points at the server, opens the firewall if you want, installs RyProx with Docker or as a system service, and prints your setup code.
+
+Prefer to read a script before running it as root? Good habit:
+
+```sh
+curl -fsSLO https://raw.githubusercontent.com/RylanQ/ryprox/main/install.sh
+less install.sh
+sudo bash install.sh
+```
+
+Run the same command again later to **update**; your routes and settings are kept.
+
+For automation, every answer can be given as an option, e.g.
+`sudo bash install.sh --docker --domain ryprox.example.com --email me@example.com --staging --yes`.
+Add `--dry-run` to see what it would do without changing anything.
+
+Or install by hand with one of the options below.
+
+### Option A: Docker Compose
 
 ```sh
 git clone https://github.com/RylanQ/ryprox.git
@@ -51,12 +75,13 @@ The container runs as a non-root user, with a read-only filesystem and no extra 
 
 ### Option B: Binary with systemd
 
-Build it (needs Go 1.26 or newer):
+Download a release from the [releases page](https://github.com/RylanQ/ryprox/releases), or build it (needs Go 1.26 or newer):
 
 ```sh
 git clone https://github.com/RylanQ/ryprox.git
 cd ryprox
 make build
+sudo useradd --system --home-dir /var/lib/ryprox --shell /usr/sbin/nologin ryprox
 sudo cp bin/ryprox /usr/local/bin/
 sudo cp deploy/ryprox.service /etc/systemd/system/
 sudo systemctl daemon-reload
@@ -64,7 +89,7 @@ sudo systemctl enable --now ryprox
 sudo journalctl -u ryprox
 ```
 
-The service file locks RyProx down: it runs as a throwaway user that can only bind ports 80/443 and write to `/var/lib/ryprox`.
+The service file locks RyProx down: it runs as the unprivileged `ryprox` user, which can only bind ports 80/443 and write to `/var/lib/ryprox`.
 
 ### Option C: Just run it (for trying out)
 
@@ -194,7 +219,7 @@ If you lose your phone, sign in with a recovery code, then make new codes under 
 | `secret.key` | Encrypts your authenticator secret. **Keep it with the database**; neither works without the other |
 | `certs/` | Certificates (RyProx can always get new ones) |
 
-**Updating**: pull the new version and rebuild (`docker compose ... up -d --build`, or `make build` and restart the service). The database upgrades itself.
+**Updating**: run the quick-install command again. If you installed by hand, pull the new version and rebuild (`docker compose ... up -d --build`, or `make build` and restart the service). The database upgrades itself.
 
 **Locked out completely** (lost phone *and* recovery codes)? On the server, run:
 
@@ -223,6 +248,7 @@ then restart RyProx. Your routes and settings are kept; a new setup code is prin
 Work through this on a real server and domain. Tick as you go.
 
 **Install and setup**
+- [ ] The quick-install script asks its questions, warns about anything wrong (DNS, busy ports), and finishes with a setup code
 - [ ] RyProx starts and prints a setup code
 - [ ] Dashboard opens through the SSH tunnel at `http://localhost:8081`
 - [ ] A wrong setup code is refused
@@ -286,7 +312,8 @@ This section is for the curious, and for anyone working on the code.
 
 | Folder | What's in it |
 | --- | --- |
-| `cmd/ryprox` | The command-line program: `serve`, `reset-admin`, `healthcheck`, `version` |
+| `cmd/ryprox` | The command-line program: `serve`, `init`, `reset-admin`, `healthcheck`, `version` |
+| `install.sh` | The quick-install script |
 | `internal/server` | Starts everything and wires the listeners together |
 | `internal/proxy` | The proxy engine: routing, load balancing, health checks |
 | `internal/certs` | Automatic HTTPS |

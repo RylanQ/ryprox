@@ -18,14 +18,13 @@ Sub-page routing and redirects, CrowdSec built in, login in front of any app (pa
 
 ## Get started
 
-Read the **[guide](docs/GUIDE.md)**. The short version, with Docker:
+On a Linux server, run:
 
 ```sh
-git clone https://github.com/RylanQ/ryprox.git && cd ryprox
-docker compose -f deploy/docker-compose.yml up -d --build
-docker compose -f deploy/docker-compose.yml logs ryprox    # shows your setup code
-ssh -L 8081:127.0.0.1:8081 you@your-server                 # then open http://localhost:8081
+curl -fsSL https://raw.githubusercontent.com/RylanQ/ryprox/main/install.sh | sudo bash
 ```
+
+It asks a few questions, sets up HTTPS, and prints your setup code. Read the **[guide](docs/GUIDE.md)** for everything else, including installing by hand.
 
 ## Build from source
 

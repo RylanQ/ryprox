@@ -18,4 +18,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   - `ryprox reset-admin` to recover a locked-out install; `ryprox healthcheck` for Docker.
   - Dockerfile (distroless, non-root), Docker Compose file and hardened systemd service.
   - User guide in `docs/GUIDE.md`.
+  - Quick-install script (`install.sh`): asks the essentials, checks ports, DNS and firewall, installs with Docker or as a system service, pre-configures HTTPS, prints the setup code, and updates existing installs.
+  - `ryprox init` to pre-configure HTTPS and the dashboard domain.
+  - Release workflow: binaries for Linux (amd64, arm64, armv7) and macOS with checksums, and multi-arch Docker images on ghcr.io.
 - Project skeleton: licence, README, security note, CI.

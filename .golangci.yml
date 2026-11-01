@@ -10,6 +10,12 @@ linters:
     - unconvert
     - noctx        # HTTP requests without a context
 
+  exclusions:
+    rules:
+      # Tests deliberately build odd inputs and simple connections.
+      - path: _test\.go
+        linters: [gosec, noctx]
+
 formatters:
   enable:
     - gofmt

@@ -61,7 +61,7 @@ func NormalizeHostname(field, h string) (string, error) {
 			return "", fieldErr(field, "domain parts can't start or end with a hyphen")
 		}
 		for _, c := range label {
-			if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-') {
+			if (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '-' {
 				return "", fieldErr(field, "domain contains an invalid character %q (use punycode for international names)", c)
 			}
 		}
@@ -119,7 +119,8 @@ func validHeaderName(name string) bool {
 	}
 	for i := 0; i < len(name); i++ {
 		c := name[i]
-		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || strings.IndexByte("!#$%&'*+-.^_`|~", c) >= 0) {
+		isAlnum := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+		if !isAlnum && strings.IndexByte("!#$%&'*+-.^_`|~", c) < 0 {
 			return false
 		}
 	}

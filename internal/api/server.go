@@ -193,8 +193,6 @@ func (s *Server) csrfProtect(next http.Handler) http.Handler {
 
 // --- sessions ----------------------------------------------------------
 
-type ctxUser struct{}
-
 func cookieName(r *http.Request) string {
 	if r.TLS != nil {
 		return "__Host-ryprox" // __Host- cookies must be Secure and host-only
@@ -203,7 +201,9 @@ func cookieName(r *http.Request) string {
 }
 
 func (s *Server) setSessionCookie(w http.ResponseWriter, r *http.Request, token string, expires time.Time) {
-	http.SetCookie(w, &http.Cookie{
+	// Secure is only false on the plain-HTTP admin listener, which is meant to be
+	// reached on localhost (directly or through an SSH tunnel).
+	http.SetCookie(w, &http.Cookie{ //nolint:gosec // see above
 		Name:     cookieName(r),
 		Value:    token,
 		Path:     "/",
@@ -215,7 +215,7 @@ func (s *Server) setSessionCookie(w http.ResponseWriter, r *http.Request, token 
 }
 
 func (s *Server) clearSessionCookie(w http.ResponseWriter, r *http.Request) {
-	http.SetCookie(w, &http.Cookie{Name: cookieName(r), Value: "", Path: "/", MaxAge: -1,
+	http.SetCookie(w, &http.Cookie{Name: cookieName(r), Value: "", Path: "/", MaxAge: -1, //nolint:gosec // as above
 		HttpOnly: true, Secure: r.TLS != nil, SameSite: http.SameSiteStrictMode})
 }
 

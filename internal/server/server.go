@@ -136,7 +136,7 @@ func Run(ctx context.Context, o Options) error {
 	errCh := make(chan error, len(servers))
 	listeners := make([]net.Listener, len(servers))
 	for i, x := range servers {
-		ln, err := net.Listen("tcp", x.s.Addr)
+		ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", x.s.Addr)
 		if err != nil {
 			for _, l := range listeners[:i] {
 				_ = l.Close()
@@ -235,7 +235,9 @@ func redirectHTTPS(w http.ResponseWriter, r *http.Request, host, port string) {
 	if port != "" && port != "443" {
 		target += ":" + port
 	}
-	http.Redirect(w, r, target+r.URL.RequestURI(), http.StatusPermanentRedirect)
+	// host is always a configured route or admin domain (checked by the caller),
+	// so this can't be used to redirect visitors to an arbitrary site.
+	http.Redirect(w, r, target+r.URL.RequestURI(), http.StatusPermanentRedirect) //nolint:gosec // see above
 }
 
 func portOf(addr string) string {

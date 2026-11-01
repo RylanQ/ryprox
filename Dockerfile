@@ -10,12 +10,15 @@ ARG VERSION=dev
 ARG COMMIT=unknown
 RUN CGO_ENABLED=0 go build -trimpath \
     -ldflags "-s -w -X github.com/rylanq/ryprox/internal/version.Version=${VERSION} -X github.com/rylanq/ryprox/internal/version.Commit=${COMMIT}" \
-    -o /out/ryprox ./cmd/ryprox
+    -o /out/ryprox ./cmd/ryprox \
+ && mkdir -p /out/data
 
 # ---- run ----
 # Distroless: no shell, no package manager, runs as a non-root user.
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/ryprox /usr/local/bin/ryprox
+# The data folder must belong to the non-root user, or RyProx can't write to it.
+COPY --from=build --chown=nonroot:nonroot /out/data /data
 ENV RYPROX_DATA=/data \
     RYPROX_HTTP=:80 \
     RYPROX_HTTPS=:443 \

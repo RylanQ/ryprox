@@ -326,7 +326,7 @@ func TestRoutesCRUDAndLiveProxy(t *testing.T) {
 	e := newEnv(t)
 	c := e.client()
 	e.setup(c)
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = fmt.Fprint(w, "hello from backend")
 	}))
 	t.Cleanup(backend.Close)

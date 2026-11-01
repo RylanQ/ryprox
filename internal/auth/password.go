@@ -111,11 +111,14 @@ func VerifyPassword(ctx context.Context, pw, encoded string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	if len(want) < 16 || len(want) > 64 {
+		return false, errors.New("invalid hash length")
+	}
 	if err := acquire(ctx); err != nil {
 		return false, err
 	}
 	defer release()
-	got := argon2.IDKey([]byte(pw), salt, t, m, p, uint32(len(want)))
+	got := argon2.IDKey([]byte(pw), salt, t, m, p, uint32(len(want))) //nolint:gosec // length checked above
 	return subtle.ConstantTimeCompare(got, want) == 1, nil
 }
 

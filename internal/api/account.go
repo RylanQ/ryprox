@@ -79,7 +79,7 @@ func validUsername(u string) error {
 		return errors.New("username must be 3 to 64 characters")
 	}
 	for _, c := range u {
-		if !(unicode.IsLetter(c) || unicode.IsDigit(c) || c == '.' || c == '_' || c == '-') {
+		if !unicode.IsLetter(c) && !unicode.IsDigit(c) && c != '.' && c != '_' && c != '-' {
 			return errors.New("username can only contain letters, numbers, dots, dashes and underscores")
 		}
 	}

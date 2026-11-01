@@ -27,7 +27,7 @@ type Box struct {
 
 // LoadOrCreate reads the key file at path, creating it (mode 0600) if missing.
 func LoadOrCreate(path string) (*Box, error) {
-	key, err := os.ReadFile(path)
+	key, err := os.ReadFile(path) //nolint:gosec // path is the operator's own data folder
 	switch {
 	case errors.Is(err, os.ErrNotExist):
 		key = make([]byte, keySize)
@@ -37,7 +37,7 @@ func LoadOrCreate(path string) (*Box, error) {
 		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 			return nil, err
 		}
-		f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600) //nolint:gosec // as above
 		if err != nil {
 			return nil, err
 		}

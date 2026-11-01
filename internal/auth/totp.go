@@ -9,6 +9,7 @@ import (
 	"crypto/subtle"
 	"encoding/base32"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
@@ -99,5 +100,9 @@ func TOTPCodeAt(secret string, t time.Time) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return totpCode(key, uint64(t.Unix()/totpPeriod), totpDigits), nil
+	c := t.Unix() / totpPeriod
+	if c < 0 {
+		return "", errors.New("time before 1970")
+	}
+	return totpCode(key, uint64(c), totpDigits), nil
 }

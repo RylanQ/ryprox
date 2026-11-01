@@ -7,6 +7,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Added
 
-- Project skeleton: licence, security policy, contributing guide, clean-room policy.
+- Project skeleton: licence, README, security note.
 - `ryprox version` and `ryprox serve` commands with a `/healthz` endpoint.
 - CI for build, test, vet, lint and vulnerability scanning.

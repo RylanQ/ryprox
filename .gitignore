@@ -1,0 +1,21 @@
+# Build output
+/bin/
+/dist/
+
+# Local data and secrets: never commit these
+*.db
+*.db-journal
+*.sqlite
+.env
+.env.*
+!.env.example
+/data/
+
+# Editors and OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Test output
+coverage.out

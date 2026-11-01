@@ -1,0 +1,16 @@
+version: "2"
+
+linters:
+  enable:
+    - gosec        # security problems
+    - bodyclose    # unclosed HTTP response bodies
+    - errorlint    # correct error wrapping
+    - misspell
+    - revive
+    - unconvert
+    - noctx        # HTTP requests without a context
+
+formatters:
+  enable:
+    - gofmt
+    - goimports

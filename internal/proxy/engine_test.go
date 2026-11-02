@@ -551,6 +551,7 @@ func TestRevokedAccessClosesWebSocket(t *testing.T) {
 	if err != nil || resp.StatusCode != 101 {
 		t.Fatalf("upgrade: %v %v", resp, err)
 	}
+	defer func() { _ = resp.Body.Close() }()
 	revoked.Store(true)
 	// The backend only answers after a line is sent; the connection must be
 	// closed by RyProx before that, without the client sending anything.

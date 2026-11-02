@@ -46,8 +46,6 @@ var portalFiles = map[string]string{
 	"favicon.svg": "image/svg+xml",
 }
 
-type ctxRoute struct{}
-
 type handoff struct {
 	userID  int64
 	host    string
@@ -244,7 +242,8 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request, route *s
 		proxy.WritePage(w, http.StatusInternalServerError, "Sign-in failed", "Something went wrong. Please try again.")
 		return
 	}
-	http.Redirect(w, r, rd, http.StatusFound)
+	// rd came through safeRedirectPath: always a path on this site.
+	http.Redirect(w, r, rd, http.StatusFound) //nolint:gosec // validated above
 }
 
 func (s *Server) buildPortal() http.Handler {

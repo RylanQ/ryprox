@@ -63,7 +63,7 @@ func TestMAC(t *testing.T) {
 	k := make([]byte, 32)
 	k[0] = 1
 	b, _ := New(k)
-	if a.MAC("p", "x") != a.MAC("p", "x") {
+	if a2, _ := New(make([]byte, 32)); a.MAC("p", "x") != a2.MAC("p", "x") {
 		t.Fatal("MAC not deterministic")
 	}
 	if a.MAC("p", "x") == b.MAC("p", "x") || a.MAC("p", "x") == a.MAC("q", "x") {

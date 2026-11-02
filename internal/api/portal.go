@@ -121,7 +121,10 @@ func (s *Server) buildPortal() http.Handler {
 		}
 		w.Header().Set("Content-Type", ct)
 		w.Header().Set("Cache-Control", "no-cache")
-		_, _ = w.Write(b)
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		// The name is checked against a fixed list and the bytes come from files
+		// built into the binary, so no visitor input is ever written here.
+		_, _ = w.Write(b) //nolint:gosec // see above
 	})
 
 	mux.HandleFunc("GET "+p+"api/state", s.handlePortalState)

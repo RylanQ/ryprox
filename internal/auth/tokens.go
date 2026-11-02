@@ -30,19 +30,25 @@ func HashToken(token string) []byte {
 const recoveryAlphabet = "abcdefghjkmnpqrstuvwxyz23456789"
 
 // NewRecoveryCodes returns n fresh codes (to show the user once) and their
-// hashes (to store).
+// unkeyed hashes. Callers that store codes should hash them with a key
+// instead (see NormalizeRecoveryCode).
 func NewRecoveryCodes(n int) (codes, hashes []string, err error) {
 	for range n {
-		b := make([]byte, 12)
-		if _, err := rand.Read(b); err != nil {
-			return nil, nil, err
-		}
 		var sb strings.Builder
-		for i, x := range b {
+		for i := 0; i < 12; {
+			var b [1]byte
+			if _, err := rand.Read(b[:]); err != nil {
+				return nil, nil, err
+			}
+			// Rejection sampling keeps every character equally likely.
+			if int(b[0]) >= 256-256%len(recoveryAlphabet) {
+				continue
+			}
 			if i > 0 && i%4 == 0 {
 				sb.WriteByte('-')
 			}
-			sb.WriteByte(recoveryAlphabet[int(x)%len(recoveryAlphabet)])
+			sb.WriteByte(recoveryAlphabet[int(b[0])%len(recoveryAlphabet)])
+			i++
 		}
 		code := sb.String()
 		codes = append(codes, code)
@@ -51,10 +57,16 @@ func NewRecoveryCodes(n int) (codes, hashes []string, err error) {
 	return codes, hashes, nil
 }
 
-// HashRecoveryCode normalises and hashes a recovery code.
+// NormalizeRecoveryCode puts a recovery code in a canonical form, so it can
+// be typed with or without dashes and in any case.
+func NormalizeRecoveryCode(code string) string {
+	return strings.ToLower(strings.NewReplacer("-", "", " ", "").Replace(strings.TrimSpace(code)))
+}
+
+// HashRecoveryCode is the original, unkeyed recovery-code hash. It is only
+// used to recognise codes created before keyed hashes were introduced.
 func HashRecoveryCode(code string) string {
-	norm := strings.ToLower(strings.NewReplacer("-", "", " ", "").Replace(strings.TrimSpace(code)))
-	sum := sha256.Sum256([]byte("ryprox-recovery:" + norm))
+	sum := sha256.Sum256([]byte("ryprox-recovery:" + NormalizeRecoveryCode(code)))
 	return hex.EncodeToString(sum[:])
 }
 

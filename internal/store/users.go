@@ -159,6 +159,12 @@ func (s *Store) UpdateUserAccess(ctx context.Context, userID int64, role string,
 			return err
 		}
 	}
+	if disabled || role != RoleAdmin {
+		// Invites only stay valid while the admin who made them still is one.
+		if err := deleteInvitesBy(ctx, tx, userID); err != nil {
+			return err
+		}
+	}
 	return tx.Commit()
 }
 
@@ -169,6 +175,9 @@ func (s *Store) DeleteUser(ctx context.Context, userID int64) error {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	if err := deleteInvitesBy(ctx, tx, userID); err != nil {
+		return err
+	}
 	res, err := tx.ExecContext(ctx, "DELETE FROM users WHERE id = ?", userID)
 	if err != nil {
 		return err
@@ -211,6 +220,12 @@ func removeUserFromRoutes(ctx context.Context, tx *sql.Tx, userID int64) error {
 		}
 	}
 	return nil
+}
+
+// deleteInvitesBy removes pending invites created by userID.
+func deleteInvitesBy(ctx context.Context, tx *sql.Tx, userID int64) error {
+	_, err := tx.ExecContext(ctx, "DELETE FROM invites WHERE created_by = (SELECT username FROM users WHERE id = ?)", userID)
+	return err
 }
 
 func checkAdminsRemain(ctx context.Context, tx *sql.Tx) error {
@@ -286,9 +301,14 @@ func (s *Store) SetRecoveryCodes(ctx context.Context, userID int64, hashes []str
 // DeleteAllAdmins removes every admin account (and their sessions). Members
 // are kept. Used by "ryprox reset-admin" to recover a locked-out install.
 func (s *Store) DeleteAllAdmins(ctx context.Context) error {
+	// Pending invites go too: any of them could have come from whoever
+	// took over an admin account.
+	if _, err := s.db.ExecContext(ctx, "DELETE FROM invites"); err != nil {
+		return err
+	}
 	_, err := s.db.ExecContext(ctx, "DELETE FROM users WHERE role = 'admin'")
 	if err == nil {
-		err = s.AddAudit(ctx, AuditEntry{Actor: "system", Action: "admin.reset", Detail: "admin accounts removed from the command line"})
+		err = s.AddAudit(ctx, AuditEntry{Actor: "system", Action: "admin.reset", Detail: "admin accounts and pending invites removed from the command line"})
 	}
 	return err
 }

@@ -59,11 +59,28 @@ func (l *Limiter) Check(key string) (ok bool, retryAfter time.Duration) {
 	return true, 0
 }
 
+// Begin reserves an attempt for key. The attempt is counted as a failure
+// straight away, so many attempts made at the same moment can't all slip
+// through before the first ones are judged. Call Reset after a success.
+func (l *Limiter) Begin(key string) (ok bool, retryAfter time.Duration) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := l.now()
+	if e := l.entries[key]; e != nil && now.Sub(e.lastFailure) <= l.forget && now.Before(e.lockedUntil) {
+		return false, e.lockedUntil.Sub(now)
+	}
+	l.failLocked(key, now)
+	return true, 0
+}
+
 // Fail records a failed attempt for key.
 func (l *Limiter) Fail(key string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	now := l.now()
+	l.failLocked(key, l.now())
+}
+
+func (l *Limiter) failLocked(key string, now time.Time) {
 	e := l.entries[key]
 	if e == nil || now.Sub(e.lastFailure) > l.forget {
 		e = &limitEntry{}

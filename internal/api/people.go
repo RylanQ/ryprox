@@ -57,17 +57,11 @@ func (s *Server) handleListPeople(w http.ResponseWriter, r *http.Request, me *st
 }
 
 // inviteBase picks the HTTPS address where someone can accept an invite.
-func (s *Server) inviteBase(routes []store.Route) string {
-	if h := s.Settings().AdminHostname; h != "" {
-		return "https://" + h
-	}
-	if !s.Certs.Enabled() {
-		return ""
-	}
-	for _, rt := range routes {
-		if rt.Enabled && !rt.Config.Access.IsPublic() {
-			return "https://" + rt.Hostname
-		}
+func (s *Server) inviteBase() string {
+	// Invites are only ever opened on RyProx's own sign-in domain, never on
+	// a route's domain, where the backend could read the token.
+	if h := s.Settings().SignInHostname(); h != "" && s.Certs.Enabled() {
+		return s.siteURL(h)
 	}
 	return ""
 }
@@ -126,7 +120,7 @@ func (s *Server) handleCreateInvite(w http.ResponseWriter, r *http.Request, me *
 	// The token goes after # so it never reaches server logs or Referer headers.
 	path := proxy.PortalPrefix + "invite#" + token
 	full := ""
-	if base := s.inviteBase(routes); base != "" {
+	if base := s.inviteBase(); base != "" {
 		full = base + path
 	}
 	s.audit(r, me.Username, "user.invite", fmt.Sprintf("%s (%s)", inv.Username, inv.Role))

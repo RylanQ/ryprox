@@ -39,7 +39,7 @@ func (s *Server) handleListRoutes(w http.ResponseWriter, r *http.Request, _ *sto
 // check is passed to the store so a change is only saved if the resulting
 // configuration is valid as a whole.
 func (s *Server) check(all []store.Route) error {
-	if err := config.CheckRoutes(all, s.Settings().AdminHostname); err != nil {
+	if err := config.CheckRoutes(all, s.Settings()); err != nil {
 		return err
 	}
 	return s.Engine.Check(all)
@@ -211,8 +211,12 @@ func (s *Server) handleCertificates(w http.ResponseWriter, r *http.Request, _ *s
 		Purpose string `json:"purpose"`
 	}
 	out := []row{}
-	if h := s.Settings().AdminHostname; h != "" {
-		out = append(out, row{s.Certs.Status(h), "Admin dashboard"})
+	st := s.Settings()
+	if st.AdminHostname != "" {
+		out = append(out, row{s.Certs.Status(st.AdminHostname), "Admin dashboard"})
+	}
+	if st.AuthHostname != "" && st.AuthHostname != st.AdminHostname {
+		out = append(out, row{s.Certs.Status(st.AuthHostname), "Sign-in page"})
 	}
 	for _, rt := range routes {
 		if rt.Enabled {
@@ -248,10 +252,15 @@ func (s *Server) handlePutSettings(w http.ResponseWriter, r *http.Request, u *st
 		s.writeErr(w, err)
 		return
 	}
-	if err := config.CheckRoutes(routes, in.AdminHostname); err != nil {
-		var msg = fmt.Sprintf("%s is already used by a route", in.AdminHostname)
-		writeJSON(w, http.StatusBadRequest, apiError{Error: msg, Field: "adminHostname"})
-		return
+	for _, rt := range routes {
+		if in.AdminHostname != "" && rt.Hostname == in.AdminHostname {
+			writeJSON(w, http.StatusBadRequest, apiError{Error: in.AdminHostname + " is already used by a route", Field: "adminHostname"})
+			return
+		}
+		if in.AuthHostname != "" && rt.Hostname == in.AuthHostname {
+			writeJSON(w, http.StatusBadRequest, apiError{Error: in.AuthHostname + " is already used by a route", Field: "authHostname"})
+			return
+		}
 	}
 	if err := s.Store.SaveSettings(r.Context(), in); err != nil {
 		s.writeErr(w, err)
@@ -261,6 +270,9 @@ func (s *Server) handlePutSettings(w http.ResponseWriter, r *http.Request, u *st
 	s.Certs.Configure(in)
 	if in.AdminHostname != "" {
 		s.Certs.Obtain(in.AdminHostname)
+	}
+	if in.AuthHostname != "" {
+		s.Certs.Obtain(in.AuthHostname)
 	}
 	for _, rt := range routes {
 		if rt.Enabled {

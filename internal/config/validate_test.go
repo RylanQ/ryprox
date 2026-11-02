@@ -128,7 +128,14 @@ func TestNormalizeSettings(t *testing.T) {
 			t.Errorf("accepted %+v", bad)
 		}
 	}
-	if err := CheckRoutes([]store.Route{{Hostname: "admin.example.com"}}, "admin.example.com"); err == nil {
+	if err := CheckRoutes([]store.Route{{Hostname: "admin.example.com"}}, store.Settings{AdminHostname: "admin.example.com"}); err == nil {
 		t.Error("route on admin hostname accepted")
+	}
+	if err := CheckRoutes([]store.Route{{Hostname: "login.example.com"}}, store.Settings{AuthHostname: "login.example.com"}); err == nil {
+		t.Error("route on sign-in hostname accepted")
+	}
+	off := store.Settings{TLSMode: store.TLSModeOff, AuthHostname: "login.example.com"}
+	if err := NormalizeSettings(&off); err == nil {
+		t.Error("sign-in domain without HTTPS accepted")
 	}
 }

@@ -266,3 +266,6 @@ dialog::backdrop { background: rgb(10 20 30 / .45); }
 .warn-inline.flush0 { margin: .75rem 0 0; }
 .row-off td { opacity: .65; }
 .small-list { font-size: .85rem; }
+.site-list { list-style: none; padding: 0; margin: 0 0 1rem; display: flex; flex-direction: column; gap: .4rem; }
+.site-list a { display: block; padding: .6rem .8rem; border: 1px solid var(--line); border-radius: var(--radius-s); background: var(--panel); text-decoration: none; }
+.site-list a:hover { border-color: var(--muted); }

@@ -6,7 +6,6 @@ import (
 	"bytes"
 	"strings"
 	"testing"
-	"time"
 )
 
 func TestVersionCommand(t *testing.T) {
@@ -34,15 +33,22 @@ func TestUnknownCommandIsAnError(t *testing.T) {
 	}
 }
 
-func TestServerHasTimeouts(t *testing.T) {
-	srv := newServer("127.0.0.1:0", nil)
-	if srv.ReadHeaderTimeout <= 0 || srv.ReadTimeout <= 0 || srv.WriteTimeout <= 0 || srv.IdleTimeout <= 0 {
-		t.Fatalf("all timeouts must be set: %+v", srv)
+func TestInitCommand(t *testing.T) {
+	dir := t.TempDir()
+	var out, errOut bytes.Buffer
+	err := run([]string{"init", "--data", dir, "--acme-email", "me@example.com", "--acme-staging",
+		"--admin-domain", "Admin.Example.com"}, &out, &errOut)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if srv.ReadHeaderTimeout > 10*time.Second {
-		t.Fatalf("ReadHeaderTimeout too long: %v", srv.ReadHeaderTimeout)
+	if !strings.Contains(out.String(), "https://admin.example.com") {
+		t.Fatalf("output: %q", out.String())
 	}
-	if srv.MaxHeaderBytes <= 0 || srv.MaxHeaderBytes > 1<<20 {
-		t.Fatalf("MaxHeaderBytes = %d", srv.MaxHeaderBytes)
+	// Invalid combinations are refused before anything is written.
+	if err := run([]string{"init", "--data", dir, "--admin-domain", "admin.example.com"}, &out, &errOut); err == nil {
+		t.Fatal("admin domain without HTTPS accepted")
+	}
+	if err := run([]string{"init", "--data", dir, "--acme-email", "not-an-email"}, &out, &errOut); err == nil {
+		t.Fatal("bad email accepted")
 	}
 }

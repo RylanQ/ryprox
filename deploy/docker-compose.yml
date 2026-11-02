@@ -1,0 +1,29 @@
+# RyProx with Docker Compose. From the repository folder:
+#
+#   docker compose -f deploy/docker-compose.yml up -d --build
+#   docker compose -f deploy/docker-compose.yml logs ryprox   # shows the first-time setup code
+#
+# The dashboard is only published on this machine's own 127.0.0.1:8081.
+# From your computer, reach it through an SSH tunnel:
+#   ssh -L 8081:127.0.0.1:8081 you@your-server
+# then open http://localhost:8081
+
+services:
+  ryprox:
+    build: ..                       # builds the image from this repository
+    container_name: ryprox
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "127.0.0.1:8081:8081"       # admin dashboard: local only, on purpose
+    volumes:
+      - ryprox-data:/data           # database, keys and certificates: back this up
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+volumes:
+  ryprox-data:

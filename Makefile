@@ -22,8 +22,8 @@ lint: ## Run go vet and golangci-lint (if installed)
 vuln: ## Scan dependencies for known vulnerabilities
 	go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 
-dev: ## Run RyProx locally on 127.0.0.1:8080
-	go run ./cmd/ryprox serve
+dev: ## Run RyProx locally (dashboard on 127.0.0.1:8081)
+	go run ./cmd/ryprox serve --http 127.0.0.1:8080 --https 127.0.0.1:8443 --data ./data
 
 clean: ## Remove build output
 	rm -rf bin

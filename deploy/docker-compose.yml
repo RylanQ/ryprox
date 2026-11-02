@@ -16,9 +16,9 @@ services:
     ports:
       - "80:80"
       - "443:443"
-      - "127.0.0.1:8081:8081"       # admin dashboard: local only, on purpose
+      - "127.0.0.1:8081:8081"       # dashboard: reachable from this host only
     volumes:
-      - ryprox-data:/data           # database, keys and certificates: back this up
+      - ryprox-data:/data           # database, key and certificates
     read_only: true
     security_opt:
       - no-new-privileges:true

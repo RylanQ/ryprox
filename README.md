@@ -1,47 +1,50 @@
 # RyProx
 
-**A self-hosted, zero-trust reverse proxy where everything is configured from the UI, and every feature is open source.**
+RyProx is a self-hosted reverse proxy with a web dashboard. It puts services from your network on the internet under your own domains, with automatic HTTPS, and requires visitors to sign in before they can open them.
 
-> **Status: alpha.** Milestone 1 is done and ready for real-world testing. Expect rough edges.
+> RyProx is in early development. Expect breaking changes until 1.0.
 
-## What it does today
+## Features
 
-- **Zero trust by default**: every new site is private. Only the people you choose can open it, after signing in with a password and authenticator code, and every request is checked again. Making a site public is an explicit choice.
-- **People and invites**: invite members (who can only open the sites you give them) or admins with a one-time link. Disable or remove someone and they're locked out on their next click.
-- **Routes from the dashboard**: send `photos.example.com` to `http://192.168.1.10:2342`. Changes go live instantly; no config files, no restarts.
-- **Automatic HTTPS** with Let's Encrypt, including a test-certificate mode and an optional HTTPS admin domain.
-- **Several services per route** with load balancing or failover, plus health checks.
-- **WebSockets**, header rules, and support for self-signed backends.
-- **Secure by default**: two-step sign-in, single-use codes, lockout on guessing, encrypted secrets, a full activity log, and a dashboard that only listens on the server itself unless you give it a domain.
+- Routes, certificates and users are managed in the dashboard. There are no configuration files, and changes apply without a restart.
+- Routes are private by default: visitors sign in with a password and an authenticator code, and every request is checked against the route's access list.
+- Automatic HTTPS certificates from Let's Encrypt or any ACME server.
+- Load balancing and failover across several backends, with health checks.
+- WebSocket support and request/response header rules.
+- A single static binary with an embedded SQLite database.
 
-## Coming next
+## Installation
 
-Sub-page routing and redirects, CrowdSec built in, passkeys and single sign-on across sites, tunnels for services behind CGNAT, and multiple nodes.
-
-## Get started
-
-On a Linux server, run:
+On a Linux server with ports 80 and 443 open:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/RylanQ/ryprox/main/install.sh | sudo bash
 ```
 
-It asks a few questions, sets up HTTPS, and prints your setup code. Read the **[guide](docs/GUIDE.md)** for everything else, including installing by hand.
+The script installs RyProx with Docker or as a systemd service and prints a one-time setup code. See [installation](docs/installation.md) for other methods.
 
-## Build from source
+## Documentation
 
-Requires Go 1.26+.
+- [Installation](docs/installation.md)
+- [Routes](docs/routes.md)
+- [Access control](docs/access-control.md)
+- [HTTPS](docs/https.md)
+- [Operations](docs/operations.md): backups, updates, recovery and troubleshooting
+- [Architecture](docs/architecture.md)
+
+## Building
+
+Requires Go 1.26 or later.
 
 ```sh
-make build     # ./bin/ryprox
-make test      # all tests, including security tests
-make dev       # run locally on high ports
+make build   # bin/ryprox
+make test
 ```
 
 ## Security
 
-Please report vulnerabilities privately. See [SECURITY.md](SECURITY.md).
+Report vulnerabilities privately; see [SECURITY.md](SECURITY.md).
 
-## Licence
+## License
 
 [AGPL-3.0](LICENSE)

@@ -27,12 +27,12 @@ sudo setcap cap_net_bind_service=+ep bin/ryprox   # bind ports 80/443 without ro
 1. Find the setup code in the log (`docker logs ryprox` or `journalctl -u ryprox`).
 2. Open the dashboard. It listens on `127.0.0.1:8081` only, so from your own computer use `ssh -L 8081:127.0.0.1:8081 user@server` and visit <http://localhost:8081>.
 3. Enter the code, create the admin account, and scan the QR code with an authenticator app.
-4. Under **Settings**, turn on automatic HTTPS. Start with test certificates, then switch to real ones once they work.
+4. Under **Settings**, turn on automatic HTTPS and set a sign-in domain (for example `login.example.com`). Start with test certificates, then switch to real ones once they work.
 
 ## How it works
 
 - **Routes** send a domain to one or more backend services. They're edited in the dashboard and apply immediately; invalid changes are rejected.
-- **Routes are private by default.** Visitors sign in with a password and authenticator code, and every request is checked against the route's list of allowed people. Public routes are an explicit choice.
+- **Routes are private by default.** Visitors are sent to the sign-in domain, sign in with a password and authenticator code, and are handed back to the site with a one-time code. Signing in never happens on a site's own domain, so a compromised app can't capture passwords. Every request is checked against the route's list of allowed people, and open connections are closed within seconds of access being removed. Public routes are an explicit choice.
 - **People** are invited with a single-use link. Members can open the routes they're given; admins can also use the dashboard.
 - Backends receive `X-RyProx-User` with the signed-in username, plus the usual `X-Forwarded-*` headers. Visitors can't set these themselves.
 

@@ -8,8 +8,11 @@ package secrets
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -20,9 +23,10 @@ import (
 const keySize = 32 // AES-256
 const prefix = "v1:"
 
-// Box seals and opens values with AES-256-GCM.
+// Box seals and opens values with AES-256-GCM, and computes keyed hashes.
 type Box struct {
-	aead cipher.AEAD
+	aead   cipher.AEAD
+	macKey []byte
 }
 
 // LoadOrCreate reads the key file at path, creating it (mode 0600) if missing.
@@ -67,7 +71,10 @@ func New(key []byte) (*Box, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Box{aead: aead}, nil
+	// A separate key for hashing, derived so the encryption key is never reused.
+	m := hmac.New(sha256.New, key)
+	m.Write([]byte("ryprox mac key v1"))
+	return &Box{aead: aead, macKey: m.Sum(nil)}, nil
 }
 
 // Seal encrypts plaintext. purpose binds the ciphertext to its use, so a
@@ -79,6 +86,16 @@ func (b *Box) Seal(plaintext, purpose string) (string, error) {
 	}
 	out := b.aead.Seal(nonce, nonce, []byte(plaintext), []byte(purpose))
 	return prefix + base64.RawStdEncoding.EncodeToString(out), nil
+}
+
+// MAC returns a keyed hash of data for purpose, as hex. Without the key
+// file, the hashes can't be checked against guesses.
+func (b *Box) MAC(purpose, data string) string {
+	m := hmac.New(sha256.New, b.macKey)
+	m.Write([]byte(purpose))
+	m.Write([]byte{0})
+	m.Write([]byte(data))
+	return hex.EncodeToString(m.Sum(nil))
 }
 
 // Open decrypts a value produced by Seal with the same purpose.

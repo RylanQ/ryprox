@@ -26,7 +26,7 @@ ENV RYPROX_DATA=/data \
     RYPROX_HTTPS=:443 \
     RYPROX_ADMIN=0.0.0.0:8081
 VOLUME /data
-EXPOSE 80 443 8081
+EXPOSE 80 443
 USER nonroot:nonroot
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s CMD ["/usr/local/bin/ryprox", "healthcheck"]
 ENTRYPOINT ["/usr/local/bin/ryprox"]

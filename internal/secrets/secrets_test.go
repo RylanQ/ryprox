@@ -57,3 +57,16 @@ func TestWrongKeyFails(t *testing.T) {
 		t.Fatal("opened garbage")
 	}
 }
+
+func TestMAC(t *testing.T) {
+	a, _ := New(make([]byte, 32))
+	k := make([]byte, 32)
+	k[0] = 1
+	b, _ := New(k)
+	if a.MAC("p", "x") != a.MAC("p", "x") {
+		t.Fatal("MAC not deterministic")
+	}
+	if a.MAC("p", "x") == b.MAC("p", "x") || a.MAC("p", "x") == a.MAC("q", "x") {
+		t.Fatal("MAC ignores key or purpose")
+	}
+}

@@ -353,12 +353,12 @@ func TestHealthChecks(t *testing.T) {
 // fakeGate lets "alice" in when she presents the right cookie.
 type fakeGate struct{}
 
-func (fakeGate) Authorize(w http.ResponseWriter, r *http.Request, _ *store.Route) (string, bool) {
+func (fakeGate) Authorize(w http.ResponseWriter, r *http.Request, _ *store.Route) (string, func() bool, bool) {
 	if c, err := r.Cookie("ryprox-access"); err == nil && c.Value == "alice-session" {
-		return "alice", true
+		return "alice", func() bool { return true }, true
 	}
 	http.Redirect(w, r, PortalPrefix+"login", http.StatusFound)
-	return "", false
+	return "", nil, false
 }
 
 func (fakeGate) Portal(w http.ResponseWriter, _ *http.Request, _ *store.Route) {
@@ -427,5 +427,138 @@ func TestPublicRouteStripsForgedIdentity(t *testing.T) {
 	// On public routes, /.ryprox/ belongs to the app.
 	if !strings.Contains(body, "cookie=") {
 		t.Fatal("public route didn't forward /.ryprox/ to the backend")
+	}
+}
+
+// --- regression tests for the security review --------------------------
+
+func privateEngine(t *testing.T, backend string) *Engine {
+	t.Helper()
+	r := route(1, "p.example.com", backend)
+	r.Config.Access = store.Access{Mode: store.AccessPrivate}
+	e := newEngine(t, r)
+	e.SetGate(fakeGate{})
+	return e
+}
+
+func TestUnderscoreHeadersDropped(t *testing.T) {
+	var got http.Header
+	b := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) { got = r.Header.Clone() }))
+	t.Cleanup(b.Close)
+	e := newEngine(t, route(1, "pub.example.com", b.URL))
+	req := httptest.NewRequestWithContext(t.Context(), "GET", "http://pub.example.com/", nil)
+	req.Header["X_Ryprox_User"] = []string{"admin"}
+	req.Header["X_forwarded_for"] = []string{"1.2.3.4"}
+	e.ServeHTTP(httptest.NewRecorder(), req)
+	for name := range got {
+		if strings.Contains(name, "_") {
+			t.Fatalf("underscore header reached the backend: %s", name)
+		}
+	}
+}
+
+func TestConnectionHeaderCantDropIdentity(t *testing.T) {
+	var user string
+	b := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) { user = r.Header.Get(UserHeader) }))
+	t.Cleanup(b.Close)
+	e := privateEngine(t, b.URL)
+	req := httptest.NewRequestWithContext(t.Context(), "GET", "http://p.example.com/", nil)
+	req.Header.Set("Cookie", "ryprox-access=alice-session")
+	req.Header.Set("Connection", "X-Ryprox-User")
+	e.ServeHTTP(httptest.NewRecorder(), req)
+	if user != "alice" {
+		t.Fatalf("identity header = %q, want alice", user)
+	}
+}
+
+func TestHeaderRuleCantOverwriteIdentity(t *testing.T) {
+	var user string
+	b := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) { user = r.Header.Get(UserHeader) }))
+	t.Cleanup(b.Close)
+	r := route(1, "p.example.com", b.URL)
+	r.Config.Access = store.Access{Mode: store.AccessPrivate}
+	r.Config.RequestHeaders = []store.HeaderRule{{Action: "set", Name: UserHeader, Value: "admin"}}
+	e := newEngine(t, r)
+	e.SetGate(fakeGate{})
+	req := httptest.NewRequestWithContext(t.Context(), "GET", "http://p.example.com/", nil)
+	req.Header.Set("Cookie", "ryprox-access=alice-session")
+	e.ServeHTTP(httptest.NewRecorder(), req)
+	if user != "alice" {
+		t.Fatalf("identity header = %q, want alice", user)
+	}
+}
+
+func TestBackendCantSetRyproxCookies(t *testing.T) {
+	b := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Add("Set-Cookie", "__Host-ryprox-access=attacker; Path=/; Secure")
+		w.Header().Add("Set-Cookie", "RYPROX=x")
+		w.Header().Add("Set-Cookie", "ryprox-access=; Max-Age=0")
+		w.Header().Add("Set-Cookie", "theme=dark")
+	}))
+	t.Cleanup(b.Close)
+	e := newEngine(t, route(1, "pub.example.com", b.URL))
+	rec := do(t, e, "pub.example.com", "/", nil)
+	got := rec.Header().Values("Set-Cookie")
+	if len(got) != 1 || got[0] != "theme=dark" {
+		t.Fatalf("Set-Cookie reaching the visitor: %q", got)
+	}
+}
+
+func TestIsRyproxCookie(t *testing.T) {
+	for _, n := range []string{"ryprox", "RyProx", "__Host-ryprox", "__host-ryprox-access", "ryprox-access", "__Secure-ryprox-x"} {
+		if !IsRyproxCookie(n) {
+			t.Errorf("%q not recognised", n)
+		}
+	}
+	for _, n := range []string{"ryproxy", "session", "theme", "my-ryprox"} {
+		if IsRyproxCookie(n) {
+			t.Errorf("%q wrongly recognised", n)
+		}
+	}
+}
+
+// revokingGate allows alice until revoked is set.
+type revokingGate struct{ revoked *atomic.Bool }
+
+func (g revokingGate) Authorize(_ http.ResponseWriter, _ *http.Request, _ *store.Route) (string, func() bool, bool) {
+	return "alice", func() bool { return !g.revoked.Load() }, true
+}
+func (revokingGate) Portal(http.ResponseWriter, *http.Request, *store.Route) {}
+
+func TestRevokedAccessClosesWebSocket(t *testing.T) {
+	old := recheckInterval.Load()
+	recheckInterval.Store(int64(50 * time.Millisecond))
+	t.Cleanup(func() { recheckInterval.Store(old) })
+
+	ws := websocketBackend(t)
+	r := route(1, "ws.example.com", ws.URL)
+	r.Config.Access = store.Access{Mode: store.AccessPrivate}
+	e := newEngine(t, r)
+	var revoked atomic.Bool
+	e.SetGate(revokingGate{&revoked})
+	front := httptest.NewServer(e)
+	t.Cleanup(front.Close)
+
+	conn, err := net.Dial("tcp", strings.TrimPrefix(front.URL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	_, _ = fmt.Fprint(conn, "GET / HTTP/1.1\r\nHost: ws.example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil || resp.StatusCode != 101 {
+		t.Fatalf("upgrade: %v %v", resp, err)
+	}
+	revoked.Store(true)
+	// The backend only answers after a line is sent; the connection must be
+	// closed by RyProx before that, without the client sending anything.
+	start := time.Now()
+	if _, err := br.ReadByte(); err == nil {
+		t.Fatal("connection still open after access was revoked")
+	}
+	if time.Since(start) > 2*time.Second {
+		t.Fatal("connection took too long to close")
 	}
 }

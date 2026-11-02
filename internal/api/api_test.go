@@ -441,7 +441,8 @@ func TestLoginTokenBoundToIP(t *testing.T) {
 	// Simulate the token being used from a different address.
 	req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/login/verify",
 		strings.NewReader(fmt.Sprintf(`{"loginToken":%q,"code":"000000"}`, token)))
-	req.RemoteAddr = "198.51.100.9:1234"
+	req.Host = "127.0.0.1"
+	req.RemoteAddr = "127.0.0.2:1234" // this machine, but a different address
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-RyProx", "1")
 	rec := httptest.NewRecorder()

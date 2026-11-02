@@ -66,9 +66,9 @@ func Run(ctx context.Context, o Options) error {
 		return fmt.Errorf("saved routes are invalid: %w", err)
 	}
 
-	adm := &api.Server{Store: st, Engine: engine, Box: box, Log: log, UI: o.UI}
+	adm := &api.Server{Store: st, Engine: engine, Box: box, Log: log, UI: o.UI, HTTPSPort: portOf(o.HTTPSAddr)}
 	cm := certs.New(filepath.Join(o.DataDir, "certs"), func(host string) bool {
-		if h := adm.Settings().AdminHostname; h != "" && host == h {
+		if set := adm.Settings(); host != "" && (host == set.AdminHostname || host == set.AuthHostname) {
 			return true
 		}
 		return engine.HasHost(host)
@@ -88,27 +88,33 @@ func Run(ctx context.Context, o Options) error {
 	cm.Configure(adm.Settings())
 
 	adminHandler := adm.Handler()
+	signInHandler := adm.SignInHandler()
 	httpsPort := portOf(o.HTTPSAddr)
 
 	// Public HTTP: Let's Encrypt challenges, HTTPS redirects, and plain-HTTP routes.
 	httpHandler := cm.HTTPHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		host := proxy.NormalizeHost(r.Host)
-		admin := adm.Settings().AdminHostname
-		if (admin != "" && host == admin) || (cm.Enabled() && engine.IsHTTPSRedirect(host)) {
+		set := adm.Settings()
+		ownDomain := host != "" && (host == set.AdminHostname || host == set.AuthHostname)
+		if ownDomain || (cm.Enabled() && engine.IsHTTPSRedirect(host)) {
 			redirectHTTPS(w, r, host, httpsPort)
 			return
 		}
 		engine.ServeHTTP(w, r)
 	}))
 
-	// Public HTTPS: the admin dashboard on its own domain (if set), else routes.
+	// Public HTTPS: RyProx's own domains (dashboard, sign-in), else routes.
 	httpsHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		host := proxy.NormalizeHost(r.Host)
-		if admin := adm.Settings().AdminHostname; admin != "" && host == admin {
+		set := adm.Settings()
+		switch {
+		case host != "" && host == set.AdminHostname:
 			adminHandler.ServeHTTP(w, r)
-			return
+		case host != "" && host == set.AuthHostname:
+			signInHandler.ServeHTTP(w, r)
+		default:
+			engine.ServeHTTP(w, r)
 		}
-		engine.ServeHTTP(w, r)
 	})
 
 	mux := http.NewServeMux()
@@ -164,6 +170,9 @@ func Run(ctx context.Context, o Options) error {
 	// Request certificates for everything up front.
 	if cm.Enabled() {
 		if h := adm.Settings().AdminHostname; h != "" {
+			cm.Obtain(h)
+		}
+		if h := adm.Settings().AuthHostname; h != "" {
 			cm.Obtain(h)
 		}
 		for _, h := range engine.Hostnames() {

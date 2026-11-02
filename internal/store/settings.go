@@ -20,6 +20,17 @@ type Settings struct {
 	ACMEEmail     string `json:"acmeEmail"`
 	ACMEStaging   bool   `json:"acmeStaging"`   // use Let's Encrypt's test servers
 	AdminHostname string `json:"adminHostname"` // optional: serve the admin UI on this domain over HTTPS
+	AuthHostname  string `json:"authHostname"`  // optional: the sign-in domain for private routes
+}
+
+// SignInHostname is the domain where people sign in to private routes: the
+// sign-in domain if set, otherwise the dashboard domain. "" means sign-in
+// from other devices isn't set up.
+func (s Settings) SignInHostname() string {
+	if s.AuthHostname != "" {
+		return s.AuthHostname
+	}
+	return s.AdminHostname
 }
 
 // DefaultSettings are used for anything not yet saved.
@@ -49,6 +60,8 @@ func (s *Store) GetSettings(ctx context.Context) (Settings, error) {
 			out.ACMEStaging, _ = strconv.ParseBool(v)
 		case "admin_hostname":
 			out.AdminHostname = v
+		case "auth_hostname":
+			out.AuthHostname = v
 		}
 	}
 	return out, rows.Err()
@@ -66,6 +79,7 @@ func (s *Store) SaveSettings(ctx context.Context, st Settings) error {
 		"acme_email":     st.ACMEEmail,
 		"acme_staging":   strconv.FormatBool(st.ACMEStaging),
 		"admin_hostname": st.AdminHostname,
+		"auth_hostname":  st.AuthHostname,
 	} {
 		if _, err := tx.ExecContext(ctx,
 			"INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", k, v); err != nil {

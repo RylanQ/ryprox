@@ -7,9 +7,10 @@ import (
 	"encoding/base64"
 	"errors"
 	"io/fs"
+	"net"
 	"net/http"
 	"net/url"
-	"slices"
+	"path"
 	"strings"
 	"time"
 
@@ -21,11 +22,24 @@ import (
 	"github.com/rylanq/ryprox/internal/version"
 )
 
-// How long an invite link works.
-const inviteTTL = 7 * 24 * time.Hour
+// Sign-in for private routes happens only on RyProx's own sign-in domain,
+// never on a route's domain. A route's backend shares its origin with
+// anything served there, so it could fake a sign-in page or install a
+// service worker over it; on a separate origin it can do neither.
+//
+//  1. A visitor without a session for photos.example.com is redirected to
+//     https://<sign-in domain>/.ryprox/login?site=photos.example.com&rd=/path
+//  2. They sign in there (or are already signed in there) and RyProx issues
+//     a one-time code for that site, bound to their IP address.
+//  3. The browser is sent to https://photos.example.com/.ryprox/callback,
+//     where RyProx redeems the code and sets a session for that site only.
 
-// Files the sign-in portal may serve. Nothing else from the dashboard is
-// ever reachable on a site.
+const (
+	inviteTTL  = 7 * 24 * time.Hour // how long an invite link works
+	handoffTTL = time.Minute        // how long a one-time sign-in code works
+)
+
+// Files the sign-in portal may serve, on the sign-in domain only.
 var portalFiles = map[string]string{
 	"portal.js":   "text/javascript; charset=utf-8",
 	"app.css":     "text/css; charset=utf-8",
@@ -34,29 +48,78 @@ var portalFiles = map[string]string{
 
 type ctxRoute struct{}
 
+type handoff struct {
+	userID  int64
+	host    string
+	ip      string
+	expires time.Time
+}
+
 // --- the gate (implements proxy.Gate) -----------------------------------
+
+// siteURL returns the HTTPS address of host, with the HTTPS port if it isn't 443.
+func (s *Server) siteURL(host string) string {
+	if s.HTTPSPort != "" && s.HTTPSPort != "443" {
+		return "https://" + net.JoinHostPort(host, s.HTTPSPort)
+	}
+	return "https://" + host
+}
+
+// signInURL returns the address of a sign-in page, or "" if no sign-in
+// domain is configured.
+func (s *Server) signInURL(page string, q url.Values) string {
+	h := s.Settings().SignInHostname()
+	if h == "" || !s.Certs.Enabled() {
+		return ""
+	}
+	u := s.siteURL(h) + proxy.PortalPrefix + page
+	if len(q) > 0 {
+		u += "?" + q.Encode()
+	}
+	return u
+}
 
 // Authorize checks every request to a private site: a valid session for
 // this exact site, an enabled account, and a place on the site's access list.
-func (s *Server) Authorize(w http.ResponseWriter, r *http.Request, route *store.Route) (string, bool) {
-	u, _ := s.sessionFor(r, realm{route.Hostname})
-	if u == nil {
-		if wantsPage(r) {
-			http.Redirect(w, r, proxy.PortalPrefix+"login?rd="+url.QueryEscape(r.URL.RequestURI()), http.StatusFound)
-		} else {
-			proxy.WritePage(w, http.StatusUnauthorized, "Sign-in needed", "This site is private. Open it in a browser to sign in.")
+func (s *Server) Authorize(w http.ResponseWriter, r *http.Request, route *store.Route) (string, func() bool, bool) {
+	rl := realm{route.Hostname}
+	u, sess := s.sessionFor(r, rl)
+	if u == nil || !route.Config.Access.Allows(u.ID) {
+		page, title, msg, code := "login", "Sign-in needed", "This site is private. Open it in a browser to sign in.", http.StatusUnauthorized
+		if u != nil {
+			page, title, msg, code = "denied", "No access", "Your account hasn't been given access to this site.", http.StatusForbidden
 		}
-		return "", false
-	}
-	if !route.Config.Access.Allows(u.ID) {
-		if wantsPage(r) {
-			http.Redirect(w, r, proxy.PortalPrefix+"denied", http.StatusFound)
-		} else {
-			proxy.WritePage(w, http.StatusForbidden, "No access", "Your account hasn't been given access to this site.")
+		if !wantsPage(r) {
+			proxy.WritePage(w, code, title, msg)
+			return "", nil, false
 		}
-		return "", false
+		target := s.signInURL(page, url.Values{"site": {route.Hostname}, "rd": {safeRedirectPath(r.URL.RequestURI())}})
+		if target == "" {
+			proxy.WritePage(w, http.StatusServiceUnavailable, "Sign-in isn't set up",
+				"This site is private, but RyProx doesn't have a sign-in domain yet. An admin can set one under Settings.")
+			return "", nil, false
+		}
+		http.Redirect(w, r, target, http.StatusFound)
+		return "", nil, false
 	}
-	return u.Username, true
+
+	// Re-checked periodically for long-lived requests.
+	tokenHash, userID, host := sess.TokenHash, u.ID, route.Hostname
+	stillAllowed := func() bool {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		cur, err := s.Store.GetSessionByHash(ctx, tokenHash)
+		if err != nil || cur.Host != host || time.Now().After(cur.ExpiresAt) {
+			return false
+		}
+		usr, err := s.Store.GetUser(ctx, userID)
+		if err != nil || usr.Disabled {
+			return false
+		}
+		rt, ok := s.Engine.Route(host)
+		return ok && (rt.Config.Access.IsPublic() || rt.Config.Access.Allows(userID))
+	}
+	return u.Username, stillAllowed, true
 }
 
 // wantsPage reports whether the request is a browser opening a page, as
@@ -74,20 +137,114 @@ func wantsPage(r *http.Request) bool {
 	return strings.Contains(r.Header.Get("Accept"), "text/html")
 }
 
-// Portal serves the sign-in pages under /.ryprox/ on a private site.
-func (s *Server) Portal(w http.ResponseWriter, r *http.Request, route *store.Route) {
-	s.portalOnce.Do(func() { s.portal = s.buildPortal() })
-	ctx := context.WithValue(r.Context(), ctxRoute{}, route)
-	s.portal.ServeHTTP(w, r.WithContext(ctx))
+// safeRedirectPath returns rd if it is a path on the same site, else "/".
+func safeRedirectPath(rd string) string {
+	if rd == "" || len(rd) > 2048 || !strings.HasPrefix(rd, "/") || strings.ContainsAny(rd, "\\\r\n\t\x00") {
+		return "/"
+	}
+	u, err := url.Parse(rd)
+	if err != nil || u.Scheme != "" || u.Host != "" || u.User != nil {
+		return "/"
+	}
+	clean := path.Clean("/" + strings.TrimLeft(u.Path, "/"))
+	if strings.HasPrefix(clean, "//") || strings.HasPrefix(clean, proxy.PortalPrefix) || clean+"/" == proxy.PortalPrefix {
+		return "/"
+	}
+	if strings.HasSuffix(u.Path, "/") && clean != "/" {
+		clean += "/"
+	}
+	out := (&url.URL{Path: clean, RawQuery: u.RawQuery}).String()
+	if !strings.HasPrefix(out, "/") || strings.HasPrefix(out, "//") {
+		return "/"
+	}
+	return out
 }
 
-// portalRealm returns the site the portal request is for, or the dashboard
-// realm when the portal is opened on the dashboard (for accepting invites).
-func portalRealm(r *http.Request) (realm, *store.Route) {
-	if rt, ok := r.Context().Value(ctxRoute{}).(*store.Route); ok && rt != nil {
-		return realm{rt.Hostname}, rt
+// Portal handles /.ryprox/ requests. On a route's domain only the sign-in
+// callback and sign-out exist; everything else is served on the sign-in
+// domain (or the local dashboard, for accepting invites).
+func (s *Server) Portal(w http.ResponseWriter, r *http.Request, route *store.Route) {
+	if route != nil {
+		s.sitePortal(w, r, route)
+		return
 	}
-	return dashboard, nil
+	s.portalOnce.Do(func() { s.portal = s.buildPortal() })
+	s.portal.ServeHTTP(w, r)
+}
+
+// SignInHandler serves the sign-in domain.
+func (s *Server) SignInHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, proxy.PortalPrefix) {
+			http.Redirect(w, r, proxy.PortalPrefix+"login", http.StatusFound)
+			return
+		}
+		s.Portal(w, r, nil)
+	})
+}
+
+// portalRealm is the realm portal requests sign in to: the sign-in domain,
+// or nil-equivalent dashboard realm when used locally.
+func (s *Server) portalRealm(r *http.Request) (realm, bool) {
+	h := s.Settings().SignInHostname()
+	if h != "" && r.TLS != nil && proxy.NormalizeHost(r.Host) == h {
+		return realm{"signin:" + h}, true
+	}
+	return dashboard, false
+}
+
+func (s *Server) sitePortal(w http.ResponseWriter, r *http.Request, route *store.Route) {
+	s.securityHeaders(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == proxy.PortalPrefix+"callback":
+			s.handleCallback(w, r, route)
+		case r.Method == http.MethodGet && r.URL.Path == proxy.PortalPrefix+"logout":
+			rl := realm{route.Hostname}
+			if u, sess := s.sessionFor(r, rl); u != nil {
+				_ = s.Store.DeleteSession(r.Context(), u.ID, sess.ID)
+			}
+			s.clearSessionCookie(w, r, rl)
+			if target := s.signInURL("logout", nil); target != "" {
+				http.Redirect(w, r, target, http.StatusFound)
+				return
+			}
+			proxy.WritePage(w, http.StatusOK, "Signed out", "You've been signed out of this site.")
+		default:
+			proxy.WritePage(w, http.StatusNotFound, "Not found", "This page doesn't exist.")
+		}
+	})).ServeHTTP(w, r)
+}
+
+// handleCallback redeems a one-time code and starts a session for one site.
+func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request, route *store.Route) {
+	code := r.URL.Query().Get("code")
+	rd := safeRedirectPath(r.URL.Query().Get("rd"))
+	key := string(auth.HashToken(code))
+	s.mu.Lock()
+	h, ok := s.handoffs[key]
+	delete(s.handoffs, key) // single use, whatever happens next
+	s.mu.Unlock()
+	if code == "" || !ok || time.Now().After(h.expires) || h.host != route.Hostname || h.ip != clientIP(r) {
+		target := s.signInURL("login", url.Values{"site": {route.Hostname}, "rd": {rd}})
+		if target == "" {
+			proxy.WritePage(w, http.StatusBadRequest, "Sign-in failed", "This sign-in link isn't valid. Please try again.")
+			return
+		}
+		http.Redirect(w, r, target, http.StatusFound)
+		return
+	}
+	u, err := s.Store.GetUser(r.Context(), h.userID)
+	if err != nil || u.Disabled || !route.Config.Access.Allows(u.ID) {
+		proxy.WritePage(w, http.StatusForbidden, "No access", "Your account hasn't been given access to this site.")
+		return
+	}
+	if err := s.startSession(w, r, u.ID, realm{route.Hostname}); err != nil {
+		s.Log.Error("could not start session", "err", err)
+		proxy.WritePage(w, http.StatusInternalServerError, "Sign-in failed", "Something went wrong. Please try again.")
+		return
+	}
+	http.Redirect(w, r, rd, http.StatusFound)
 }
 
 func (s *Server) buildPortal() http.Handler {
@@ -129,31 +286,31 @@ func (s *Server) buildPortal() http.Handler {
 
 	mux.HandleFunc("GET "+p+"api/state", s.handlePortalState)
 	mux.HandleFunc("POST "+p+"api/login", func(w http.ResponseWriter, r *http.Request) {
-		rl, rt := portalRealm(r)
-		if rt == nil {
+		rl, ok := s.portalRealm(r)
+		if !ok {
 			writeError(w, http.StatusNotFound, "sign in on the dashboard instead")
 			return
 		}
 		s.loginPassword(w, r, rl)
 	})
 	mux.HandleFunc("POST "+p+"api/login/verify", func(w http.ResponseWriter, r *http.Request) {
-		rl, rt := portalRealm(r)
-		if rt == nil {
+		rl, ok := s.portalRealm(r)
+		if !ok {
 			writeError(w, http.StatusNotFound, "sign in on the dashboard instead")
 			return
 		}
-		s.loginVerify(w, r, rl, func(u *store.User) string {
-			if !rt.Config.Access.Allows(u.ID) {
-				return "your account hasn't been given access to " + rt.Hostname + "; ask whoever runs it"
-			}
-			return ""
-		})
+		s.loginVerify(w, r, rl, func(*store.User) string { return "" })
 	})
+	mux.HandleFunc("POST "+p+"api/continue", s.handleContinue)
 	mux.HandleFunc("POST "+p+"api/logout", func(w http.ResponseWriter, r *http.Request) {
-		rl, _ := portalRealm(r)
+		rl, ok := s.portalRealm(r)
+		if !ok {
+			writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+			return
+		}
 		if u, sess := s.sessionFor(r, rl); u != nil {
 			_ = s.Store.DeleteSession(r.Context(), u.ID, sess.ID)
-			s.audit(r, u.Username, "logout", "signed out of "+rl.host)
+			s.audit(r, u.Username, "logout", "signed out of the sign-in page")
 		}
 		s.clearSessionCookie(w, r, rl)
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
@@ -162,41 +319,83 @@ func (s *Server) buildPortal() http.Handler {
 	mux.HandleFunc("POST "+p+"api/invite/finish", s.handleInviteFinish)
 	mux.HandleFunc(p, func(w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) })
 
-	return s.securityHeaders(s.csrfProtect(requireSecurePost(mux)))
+	return s.securityHeaders(s.csrfProtect(s.requireSecurePost(mux)))
 }
 
-// requireSecurePost refuses to accept passwords over plain HTTP, except
-// from the server itself (local use or an SSH tunnel).
-func requireSecurePost(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPost && r.TLS == nil && !isLoopback(r) {
-			writeError(w, http.StatusForbidden, "signing in needs HTTPS; turn on automatic HTTPS in RyProx's settings")
-			return
+// allowedSites lists the enabled private routes userID may open.
+func (s *Server) allowedSites(userID int64) []string {
+	out := []string{}
+	for _, h := range s.Engine.Hostnames() {
+		if rt, ok := s.Engine.Route(h); ok && !rt.Config.Access.IsPublic() && rt.Config.Access.Allows(userID) {
+			out = append(out, h)
 		}
-		next.ServeHTTP(w, r)
-	})
+	}
+	return out
 }
 
 func (s *Server) handlePortalState(w http.ResponseWriter, r *http.Request) {
-	rl, rt := portalRealm(r)
+	rl, onSignIn := s.portalRealm(r)
 	out := map[string]any{
-		"site":    rl.host,
-		"secure":  r.TLS != nil || isLoopback(r),
-		"version": version.Version,
+		"signInDomain": onSignIn,
+		"secure":       r.TLS != nil || s.isLocal(r),
+		"version":      version.Version,
 	}
-	if rt != nil {
+	if onSignIn {
 		if u, _ := s.sessionFor(r, rl); u != nil {
 			out["user"] = u.Username
-			out["allowed"] = rt.Config.Access.Allows(u.ID)
+			out["sites"] = s.allowedSites(u.ID)
 		}
 	}
 	writeJSON(w, http.StatusOK, out)
 }
 
+// handleContinue issues a one-time code that signs the visitor in to one
+// site, if they're signed in on the sign-in domain and allowed there.
+func (s *Server) handleContinue(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Site string `json:"site"`
+		RD   string `json:"rd"`
+	}
+	if !readJSON(w, r, &in) {
+		return
+	}
+	rl, ok := s.portalRealm(r)
+	if !ok {
+		writeError(w, http.StatusNotFound, "not available here")
+		return
+	}
+	u, _ := s.sessionFor(r, rl)
+	if u == nil {
+		writeError(w, http.StatusUnauthorized, "please sign in")
+		return
+	}
+	host := proxy.NormalizeHost(in.Site)
+	rt, ok := s.Engine.Route(host)
+	if !ok || rt.Config.Access.IsPublic() {
+		writeError(w, http.StatusNotFound, "that site isn't a private site on this RyProx")
+		return
+	}
+	if !rt.Config.Access.Allows(u.ID) {
+		s.audit(r, u.Username, "access.denied", host)
+		writeJSON(w, http.StatusForbidden, map[string]any{"error": "your account hasn't been given access to " + host, "denied": true})
+		return
+	}
+	code, err := auth.NewToken()
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	s.mu.Lock()
+	s.handoffs[string(auth.HashToken(code))] = handoff{userID: u.ID, host: host, ip: clientIP(r), expires: time.Now().Add(handoffTTL)}
+	s.mu.Unlock()
+	q := url.Values{"code": {code}, "rd": {safeRedirectPath(in.RD)}}
+	writeJSON(w, http.StatusOK, map[string]string{"url": s.siteURL(host) + proxy.PortalPrefix + "callback?" + q.Encode()})
+}
+
 // --- invites -------------------------------------------------------------
 
 func (s *Server) lookupInvite(w http.ResponseWriter, r *http.Request, token string) *store.Invite {
-	ip := clientIP(r)
+	ip := clientKey(r)
 	if ok, _ := s.ipLimit.Check("invite:" + ip); !ok {
 		writeError(w, http.StatusTooManyRequests, "too many attempts; try again later")
 		return nil
@@ -275,7 +474,7 @@ func (s *Server) handleInviteFinish(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, err)
 		return
 	}
-	codes, hashes, err := auth.NewRecoveryCodes(10)
+	codes, hashes, err := s.newRecoveryCodes()
 	if err != nil {
 		s.writeErr(w, err)
 		return
@@ -298,13 +497,10 @@ func (s *Server) handleInviteFinish(w http.ResponseWriter, r *http.Request) {
 	s.grantAccess(r, u.ID, inv.Routes)
 	s.audit(r, u.Username, "user.joined", "accepted an invite from "+inv.CreatedBy)
 
-	// Sign them straight in if they accepted the invite on a site they can open.
-	rl, rt := portalRealm(r)
+	// On the sign-in domain, sign them straight in there.
 	signedIn := false
-	if rt != nil && slices.Contains(inv.Routes, rt.ID) {
-		if err := s.startSession(w, r, u.ID, rl); err == nil {
-			signedIn = true
-		}
+	if rl, ok := s.portalRealm(r); ok {
+		signedIn = s.startSession(w, r, u.ID, rl) == nil
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"recoveryCodes": codes, "signedIn": signedIn, "username": u.Username})
 }

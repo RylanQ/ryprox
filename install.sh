@@ -14,7 +14,8 @@
 #
 # Options (all optional; anything not given is asked for):
 #   --docker | --native     how to install
-#   --domain NAME           serve the dashboard at https://NAME
+#   --signin-domain NAME    where people sign in to private sites, e.g. login.example.com
+#   --dashboard-domain NAME also serve the dashboard at https://NAME (default: local only)
 #   --email ADDRESS         email for Let's Encrypt (turns on automatic HTTPS)
 #   --staging | --no-staging  start with test certificates (default: yes)
 #   --version vX.Y.Z        install a specific version (default: newest)
@@ -32,7 +33,7 @@ CONTAINER=ryprox
 VOLUME=ryprox-data
 ADMIN_PORT=8081
 
-METHOD="" DOMAIN="" EMAIL="" STAGING="" VERSION="" YES=0 DRY=0
+METHOD="" DOMAIN="" DASHBOARD="" EMAIL="" STAGING="" VERSION="" YES=0 DRY=0
 
 # ---------- output ----------
 if [ -t 1 ]; then
@@ -88,7 +89,8 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --docker) METHOD=docker ;;
     --native) METHOD=native ;;
-    --domain) DOMAIN=${2:?--domain needs a value}; shift ;;
+    --signin-domain|--domain) DOMAIN=${2:?--signin-domain needs a value}; shift ;;
+    --dashboard-domain) DASHBOARD=${2:?--dashboard-domain needs a value}; shift ;;
     --email) EMAIL=${2:?--email needs a value}; shift ;;
     --staging) STAGING=yes ;;
     --no-staging) STAGING=no ;;
@@ -171,10 +173,10 @@ if [ -z "$EXISTING" ]; then
   normalize_domain() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed 's#^https\{0,1\}://##; s#/.*$##; s#\.$##'; }
   DOMAIN=$(normalize_domain "$DOMAIN")
   if [ -z "$DOMAIN" ]; then
-    say "  You can open the dashboard at its own address (e.g. ryprox.example.com) with HTTPS."
-    say "  Leave this empty to only reach it through an SSH tunnel."
+    say "  People sign in to your private sites on one domain of RyProx's own, such as"
+    say "  login.example.com. Create a DNS record for it. Leave empty to set it up later."
     while :; do
-      ask DOMAIN "  Dashboard domain" ""
+      ask DOMAIN "  Sign-in domain" ""
       DOMAIN=$(normalize_domain "$DOMAIN")
       if [ -z "$DOMAIN" ] || valid_domain "$DOMAIN"; then break; fi
       if [ "$YES" = 1 ] || [ -z "$TTY" ]; then die "invalid domain: $DOMAIN"; fi
@@ -182,22 +184,24 @@ if [ -z "$EXISTING" ]; then
     done
   fi
   if [ -n "$DOMAIN" ] && ! valid_domain "$DOMAIN"; then die "invalid domain: $DOMAIN"; fi
+  DASHBOARD=$(normalize_domain "$DASHBOARD")
+  if [ -n "$DASHBOARD" ] && ! valid_domain "$DASHBOARD"; then die "invalid domain: $DASHBOARD"; fi
 
   if [ -z "$EMAIL" ]; then
-    if [ -n "$DOMAIN" ]; then
+    if [ -n "$DOMAIN$DASHBOARD" ]; then
       say "  Let's Encrypt needs an email for certificate expiry warnings."
     else
       say "  For automatic HTTPS, enter an email for Let's Encrypt. Leave empty to set up HTTPS later."
     fi
     while :; do
       ask EMAIL "  Email" ""
-      if { [ -z "$EMAIL" ] && [ -z "$DOMAIN" ]; } || valid_email "$EMAIL"; then break; fi
-      if [ "$YES" = 1 ] || [ -z "$TTY" ]; then die "a valid --email is needed with --domain"; fi
+      if { [ -z "$EMAIL" ] && [ -z "$DOMAIN$DASHBOARD" ]; } || valid_email "$EMAIL"; then break; fi
+      if [ "$YES" = 1 ] || [ -z "$TTY" ]; then die "a valid --email is needed with a domain"; fi
       warn "Please enter a valid email address."
     done
   fi
   if [ -n "$EMAIL" ] && ! valid_email "$EMAIL"; then die "invalid email: $EMAIL"; fi
-  if [ -n "$DOMAIN" ] && [ -z "$EMAIL" ]; then die "a dashboard domain needs an email for its HTTPS certificate"; fi
+  if [ -n "$DOMAIN$DASHBOARD" ] && [ -z "$EMAIL" ]; then die "a domain needs an email for its HTTPS certificate"; fi
 
   if [ -n "$EMAIL" ] && [ -z "$STAGING" ]; then
     say "  Test certificates let you get everything working without hitting Let's Encrypt's limits."
@@ -246,7 +250,8 @@ if [ -z "$EXISTING" ]; then
 
   step "Ready to install"
   say "  Method:     $([ "$METHOD" = docker ] && echo Docker || echo 'system service')"
-  say "  Dashboard:  $([ -n "$DOMAIN" ] && echo "https://$DOMAIN" || echo 'SSH tunnel only')"
+  say "  Sign-in:    $([ -n "$DOMAIN" ] && echo "https://$DOMAIN" || echo 'set up later in Settings')"
+  say "  Dashboard:  $([ -n "$DASHBOARD" ] && echo "https://$DASHBOARD" || echo 'this server only (SSH tunnel)')"
   say "  HTTPS:      $([ -n "$EMAIL" ] && { [ "$STAGING" = yes ] && echo "automatic (test certificates)" || echo automatic; } || echo 'off for now (turn on in Settings)')"
   confirm "  Install now?" y || die "cancelled; nothing was changed."
 fi
@@ -256,7 +261,8 @@ if [ -n "$EMAIL" ]; then
   INIT_ARGS+=(--acme-email "$EMAIL")
   if [ "$STAGING" = yes ]; then INIT_ARGS+=(--acme-staging); fi
 fi
-if [ -n "$DOMAIN" ]; then INIT_ARGS+=(--admin-domain "$DOMAIN"); fi
+if [ -n "$DOMAIN" ]; then INIT_ARGS+=(--auth-domain "$DOMAIN"); fi
+if [ -n "$DASHBOARD" ]; then INIT_ARGS+=(--admin-domain "$DASHBOARD"); fi
 
 # ---------- install: Docker ----------
 install_docker() {
@@ -411,8 +417,8 @@ else
   fi
   say ""
   say "  Open the dashboard and enter the code to create your admin account:"
-  if [ -n "$DOMAIN" ]; then
-    say "    https://$DOMAIN"
+  if [ -n "$DASHBOARD" ]; then
+    say "    https://$DASHBOARD"
     say "    ${D}(the certificate can take a minute; until then, use the tunnel below)${N}"
   fi
   say "    From your computer:  ssh -L $ADMIN_PORT:127.0.0.1:$ADMIN_PORT you@${PUBLIC_IP:-this-server}"

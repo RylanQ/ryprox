@@ -51,6 +51,7 @@ func newEnv(t *testing.T) *env {
 	if err != nil {
 		t.Fatal(err)
 	}
+	eng.SetGate(s)
 	ts := httptest.NewServer(s.Handler())
 	t.Cleanup(ts.Close)
 	return &env{t: t, srv: s, ts: ts, code: code, engine: eng}
@@ -332,7 +333,8 @@ func TestRoutesCRUDAndLiveProxy(t *testing.T) {
 	t.Cleanup(backend.Close)
 
 	route := map[string]any{"hostname": "App.Example.com", "enabled": true,
-		"config": map[string]any{"targets": []map[string]string{{"url": backend.URL}}, "websockets": true}}
+		"config": map[string]any{"targets": []map[string]string{{"url": backend.URL}}, "websockets": true,
+			"access": map[string]any{"mode": "public"}}}
 	code, out := c.post("/api/routes", route)
 	if code != 201 || out["hostname"] != "app.example.com" {
 		t.Fatalf("create: %d %v", code, out)

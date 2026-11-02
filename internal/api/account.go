@@ -142,7 +142,7 @@ func (s *Server) handleSetupFinish(w http.ResponseWriter, r *http.Request) {
 	s.setupHash = nil
 	s.mu.Unlock()
 
-	if err := s.startSession(w, r, u.ID); err != nil {
+	if err := s.startSession(w, r, u.ID, dashboard); err != nil {
 		s.writeErr(w, err)
 		return
 	}
@@ -153,6 +153,20 @@ func (s *Server) handleSetupFinish(w http.ResponseWriter, r *http.Request) {
 // --- login -------------------------------------------------------------
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+	s.loginPassword(w, r, dashboard)
+}
+
+func (s *Server) handleLoginVerify(w http.ResponseWriter, r *http.Request) {
+	s.loginVerify(w, r, dashboard, func(u *store.User) string {
+		if u.Role != store.RoleAdmin {
+			return "this account can't manage RyProx; open the sites you've been given instead"
+		}
+		return ""
+	})
+}
+
+// loginPassword is step one of signing in to a realm: the password.
+func (s *Server) loginPassword(w http.ResponseWriter, r *http.Request, rl realm) {
 	var in struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
@@ -175,8 +189,9 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	fail := func() {
 		s.limiter.Fail(userKey)
 		s.ipLimit.Fail(ipKey)
-		s.Log.Warn("failed login", "username", in.Username, "ip", ip)
-		// Same message whether the username or password was wrong.
+		s.Log.Warn("failed login", "username", in.Username, "ip", ip, "site", rl.host)
+		// Same message whether the username or password was wrong, or the
+		// account is disabled, so nothing is revealed about which accounts exist.
 		writeError(w, http.StatusUnauthorized, "wrong username or password")
 	}
 
@@ -194,7 +209,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, err.Error())
 		return
 	}
-	if err != nil || !ok {
+	if err != nil || !ok || u.Disabled {
 		fail()
 		return
 	}
@@ -205,12 +220,15 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.mu.Lock()
-	s.pending[string(auth.HashToken(token))] = pendingLogin{userID: u.ID, ip: ip, expires: time.Now().Add(pendingLoginTTL)}
+	s.pending[string(auth.HashToken(token))] = pendingLogin{userID: u.ID, ip: ip, realm: rl, expires: time.Now().Add(pendingLoginTTL)}
 	s.mu.Unlock()
 	writeJSON(w, http.StatusOK, map[string]any{"needCode": true, "loginToken": token})
 }
 
-func (s *Server) handleLoginVerify(w http.ResponseWriter, r *http.Request) {
+// loginVerify is step two: the authenticator or recovery code. Only after
+// both steps does authorize decide whether this person may use the realm;
+// it returns a reason to refuse, or "".
+func (s *Server) loginVerify(w http.ResponseWriter, r *http.Request, rl realm, authorize func(*store.User) string) {
 	var in struct {
 		LoginToken string `json:"loginToken"`
 		Code       string `json:"code"`
@@ -222,7 +240,7 @@ func (s *Server) handleLoginVerify(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	p, ok := s.pending[key]
 	s.mu.Unlock()
-	if !ok || time.Now().After(p.expires) || p.ip != clientIP(r) {
+	if !ok || time.Now().After(p.expires) || p.ip != clientIP(r) || p.realm != rl {
 		writeError(w, http.StatusUnauthorized, "your login expired; please enter your password again")
 		return
 	}
@@ -232,8 +250,8 @@ func (s *Server) handleLoginVerify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	u, err := s.Store.GetUser(r.Context(), p.userID)
-	if err != nil {
-		s.writeErr(w, err)
+	if err != nil || u.Disabled {
+		writeError(w, http.StatusUnauthorized, "your login expired; please enter your password again")
 		return
 	}
 
@@ -262,7 +280,7 @@ func (s *Server) handleLoginVerify(w http.ResponseWriter, r *http.Request) {
 	}
 	if !valid {
 		s.limiter.Fail(userKey)
-		s.Log.Warn("wrong two-factor code", "username", u.Username, "ip", clientIP(r))
+		s.Log.Warn("wrong two-factor code", "username", u.Username, "ip", clientIP(r), "site", rl.host)
 		writeJSON(w, http.StatusUnauthorized, apiError{Error: "that code isn't right", Field: "code"})
 		return
 	}
@@ -274,11 +292,20 @@ func (s *Server) handleLoginVerify(w http.ResponseWriter, r *http.Request) {
 	s.limiter.Reset("user:" + strings.ToLower(u.Username))
 	s.ipLimit.Reset("ip:" + clientIP(r))
 
-	if err := s.startSession(w, r, u.ID); err != nil {
+	where := "the dashboard"
+	if rl.host != "" {
+		where = rl.host
+	}
+	if reason := authorize(u); reason != "" {
+		s.audit(r, u.Username, "access.denied", where)
+		writeError(w, http.StatusForbidden, reason)
+		return
+	}
+	if err := s.startSession(w, r, u.ID, rl); err != nil {
 		s.writeErr(w, err)
 		return
 	}
-	s.audit(r, u.Username, "login", "signed in with "+method)
+	s.audit(r, u.Username, "login", "signed in to "+where+" with "+method)
 	out := map[string]any{"ok": true}
 	if method == "recovery code" {
 		latest, _ := s.Store.GetUser(r.Context(), u.ID)
@@ -291,7 +318,7 @@ func (s *Server) handleLoginVerify(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request, u *store.User, sess *store.Session) {
 	_ = s.Store.DeleteSession(r.Context(), u.ID, sess.ID)
-	s.clearSessionCookie(w, r)
+	s.clearSessionCookie(w, r, dashboard)
 	s.audit(r, u.Username, "logout", "")
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }

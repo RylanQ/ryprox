@@ -22,6 +22,11 @@ function h(tag, attrs, ...kids) {
 }
 const $app = () => document.getElementById("app");
 function mount(...nodes) { $app().replaceChildren(...nodes); }
+// Element.replaceChildren turns null into the text "null"; drop empty slots first.
+for (const proto of [Element.prototype, DocumentFragment.prototype]) {
+  const orig = proto.replaceChildren;
+  proto.replaceChildren = function (...nodes) { return orig.apply(this, nodes.filter((n) => n != null && n !== false)); };
+}
 
 const brandMark = () => {
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
@@ -186,6 +191,7 @@ function render() {
   const m = path.match(/^\/routes\/(new|\d+)$/);
   if (m) return routeEditor(m[1] === "new" ? null : Number(m[1]));
   if (path === "/certificates") return certificatesPage();
+  if (path === "/people") return peoplePage();
   if (path === "/settings") return settingsPage();
   if (path === "/activity") return activityPage();
   return routesPage();
@@ -203,6 +209,7 @@ function shell(current, ...content) {
       h("div", { class: "brand" }, brandMark(), "RyProx"),
       h("nav", { class: "nav", "aria-label": "Main" },
         link("#/", "Routes", "routes"),
+        link("#/people", "People", "people"),
         link("#/certificates", "Certificates", "certs"),
         link("#/activity", "Activity", "activity"),
         link("#/settings", "Settings", "settings")),
@@ -402,6 +409,12 @@ function certPill(c, httpsOn) {
   return h("span", { class: "pill " + cls, title: c.error || "" }, label);
 }
 
+function accessPill(a) {
+  if (a && a.mode === "public") return h("span", { class: "pill wait", title: "Anyone on the internet can open this site" }, "Public");
+  const n = (a && a.users ? a.users.length : 0);
+  return h("span", { class: "pill ok", title: "Only chosen people, after signing in" }, n === 1 ? "Private · 1 person" : `Private · ${n} people`);
+}
+
 async function routesPage() {
   const board = h("div", { class: "board", "aria-busy": "true" });
   const main = shell("routes",
@@ -451,7 +464,7 @@ function routeRow(r, httpsOn, reload) {
     h("label", { class: "switch m0" }, sw),
     h("div", { class: "host" },
       h("a", { href: `${scheme}://${r.hostname}`, target: "_blank", rel: "noopener noreferrer" }, r.hostname),
-      h("div", { class: "meta" }, certPill(r.cert, httpsOn), " ",
+      h("div", { class: "meta" }, certPill(r.cert, httpsOn), " ", accessPill(r.config.access), " ",
         r.config.targets.length > 1 ? (r.config.loadBalancing === "failover" ? "Failover" : "Load balanced") : "")),
     h("div", { class: "wire", "data-state": ws, role: "img", "aria-label": stateLabel, title: stateLabel }),
     h("ul", { class: "targets", "aria-label": "Services" },
@@ -472,12 +485,16 @@ function defaultRoute() {
       targets: [{ url: "" }], loadBalancing: "round_robin", tlsSkipVerify: false, websockets: true,
       httpsRedirect: true, preserveHost: false, requestHeaders: [], responseHeaders: [],
       healthCheck: { enabled: false, path: "/", intervalSeconds: 15 },
+      access: { mode: "private", users: [] },
     },
   };
 }
 
 async function routeEditor(id) {
   let route = defaultRoute();
+  let people, settings;
+  try { [people, settings] = await Promise.all([api("GET", "/api/people"), api("GET", "/api/settings")]); } catch { return; }
+  if (id == null) route.config.access.users = [people.me]; // you, to start with
   if (id != null) {
     try {
       const data = await api("GET", "/api/routes");
@@ -486,6 +503,8 @@ async function routeEditor(id) {
       route = { hostname: found.hostname, enabled: found.enabled, config: structuredClone(found.config) };
       route.config.requestHeaders ||= [];
       route.config.responseHeaders ||= [];
+      route.config.access ||= { mode: "private", users: [] };
+      route.config.access.users ||= [];
     } catch { return; }
   }
   const c = route.config;
@@ -494,6 +513,31 @@ async function routeEditor(id) {
   // Basics
   const host = h("input", { type: "text", "data-field": "hostname", value: route.hostname, placeholder: "app.example.com", spellcheck: "false", class: "mono", autocapitalize: "off" });
   const enabled = toggle("Route is on", "Turn off to stop serving this domain without deleting the route.", route.enabled);
+
+  // Access: private by default (zero trust); public is an explicit choice.
+  const accessPrivate = h("input", { type: "radio", name: "access", value: "private", checked: c.access.mode !== "public", "data-field": "access.mode" });
+  const accessPublic = h("input", { type: "radio", name: "access", value: "public", checked: c.access.mode === "public" });
+  const chosen = new Set(c.access.users);
+  const peopleList = h("div", { class: "people-pick", "data-field": "access.users", tabindex: "-1" },
+    people.people.map((p) => h("label", { class: "pick" },
+      h("input", { type: "checkbox", value: String(p.id), checked: chosen.has(p.id) }),
+      h("span", {}, p.username, p.id === people.me ? " (you)" : "", p.disabled ? " · disabled" : ""),
+      h("span", { class: "muted" }, p.role === "admin" ? "Admin" : "Member"))));
+  const noOne = h("div", { class: "warn-inline flush", hidden: true }, "Nobody is chosen, so nobody can open this site.");
+  const syncPeople = () => {
+    const priv = accessPrivate.checked;
+    peopleList.hidden = !priv;
+    if (httpsNote) httpsNote.hidden = !priv;
+    publicWarn.hidden = priv;
+    noOne.hidden = !priv || peopleList.querySelector("input:checked") != null;
+  };
+  const publicWarn = h("div", { class: "warn-inline flush", hidden: true },
+    "Anyone on the internet can open this site, without signing in. Only choose this for things meant to be public, and make sure the app has its own login.");
+  peopleList.addEventListener("change", syncPeople);
+  const invitePeople = h("p", { class: "muted mt" }, "Need someone else? ", h("a", { href: "#/people" }, "Invite them on the People page"), ".");
+  const httpsNote = settings.tlsMode === "acme" ? null : h("div", { class: "warn-inline flush" },
+    "HTTPS is off, so people can't sign in from other devices yet (RyProx never accepts passwords over plain HTTP). ",
+    h("a", { href: "#/settings" }, "Turn on automatic HTTPS"), ".");
 
   // Targets
   const tlist = h("div", { class: "target-list" });
@@ -591,6 +635,12 @@ async function routeEditor(id) {
       field("Domain name", host, "Point this domain's DNS at this server first."),
       enabled),
     h("section", { class: "section" },
+      h("header", {}, h("h2", {}, "Who can open this site?"), h("p", {}, "RyProx checks every request. People must sign in with their password and authenticator code.")),
+      h("label", { class: "switch" }, accessPrivate, h("span", {}, h("b", {}, "Only people I choose"), h("small", {}, "Recommended. Everyone else gets a sign-in page."))),
+      peopleList, noOne, httpsNote, invitePeople,
+      h("label", { class: "switch mt" }, accessPublic, h("span", {}, h("b", {}, "Anyone on the internet"), h("small", {}, "No sign-in. For public websites."))),
+      publicWarn),
+    h("section", { class: "section" },
       h("header", {}, h("h2", {}, "Services"), h("p", {}, "Where visitors are sent. Use the address you'd type on your own network.")),
       tlist,
       h("button", { class: "btn small", type: "button", onclick: () => addTarget("") }, "Add another service"),
@@ -610,6 +660,10 @@ async function routeEditor(id) {
 
   if (route.config.requestHeaders.length || route.config.responseHeaders.length) form.querySelector("details").open = true;
 
+  accessPrivate.addEventListener("change", syncPeople);
+  accessPublic.addEventListener("change", syncPeople);
+  syncPeople();
+
   form.addEventListener("submit", async (ev) => {
     ev.preventDefault();
     clearErrors(form);
@@ -626,6 +680,10 @@ async function routeEditor(id) {
         requestHeaders: reqRules.read(),
         responseHeaders: resRules.read(),
         healthCheck: { enabled: hc.querySelector("input").checked, path: hcPath.value, intervalSeconds: Number(hcInt.value) || 15 },
+        access: {
+          mode: accessPublic.checked ? "public" : "private",
+          users: [...peopleList.querySelectorAll("input:checked")].map((i) => Number(i.value)),
+        },
       },
     };
     busy(saveBtn, true, "Saving…");
@@ -823,6 +881,117 @@ function describeUA(ua) {
   return os ? `${browser} on ${os}` : browser;
 }
 
+// ---------- people ----------
+async function peoplePage() {
+  const body = h("div", { "aria-busy": "true" });
+  shell("people",
+    h("div", { class: "page-head" }, h("div", {}, h("h1", {}, "People"),
+      h("p", { class: "lede" }, "Everyone who can sign in. Members can only open the private sites you give them; admins can also manage RyProx."))),
+    body);
+
+  const load = async () => {
+    let data, routes;
+    try { [data, routes] = await Promise.all([api("GET", "/api/people"), api("GET", "/api/routes")]); } catch { return; }
+    body.removeAttribute("aria-busy");
+    const privateRoutes = routes.routes.filter((r) => !r.config.access || r.config.access.mode !== "public");
+
+    // Invite form
+    const name = h("input", { type: "text", "data-field": "username", autocomplete: "off", spellcheck: "false", autocapitalize: "off" });
+    const role = h("select", { "data-field": "role" }, h("option", { value: "member" }, "Member"), h("option", { value: "admin" }, "Admin"));
+    const sites = h("div", { class: "people-pick inset", "data-field": "routes", tabindex: "-1" },
+      privateRoutes.length ? privateRoutes.map((r) => h("label", { class: "pick" },
+        h("input", { type: "checkbox", value: String(r.id) }), h("span", { class: "mono" }, r.hostname)))
+        : h("p", { class: "muted" }, "No private sites yet. You can give access later from each route."));
+    const sendBtn = h("button", { class: "btn primary", type: "submit" }, "Create invite link");
+    const result = h("div", {});
+    const form = h("form", { novalidate: true },
+      h("div", { class: "two" }, field("Username", name, "Letters, numbers, dots, dashes and underscores."),
+        field("Role", role, "Admins can also manage RyProx.")),
+      h("div", { class: "field" }, h("span", {}, "Sites they can open"), sites),
+      h("div", { class: "actions" }, sendBtn), result);
+    form.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      clearErrors(form);
+      busy(sendBtn, true, "Creating…");
+      try {
+        const r = await api("POST", "/api/invites", {
+          username: name.value, role: role.value,
+          routes: [...sites.querySelectorAll("input:checked")].map((i) => Number(i.value)),
+        });
+        const link = r.url || (location.origin + r.path);
+        result.replaceChildren(h("div", { class: "invite-link" },
+          h("p", {}, h("b", {}, `Send this link to ${r.invite.username}.`), " It works once and expires in 7 days. It won't be shown again."),
+          h("div", { class: "row" }, h("input", { type: "text", readonly: true, value: link, class: "mono", "aria-label": "Invite link", onfocus: (e) => e.target.select() }),
+            h("button", { class: "btn", type: "button", onclick: () => copy(link) }, "Copy")),
+          r.https ? null : h("p", { class: "warn-inline flush0" },
+            "This link only works from this computer, because there's no HTTPS address yet. Turn on automatic HTTPS and add an admin domain or a private site, then create a new invite.")));
+        name.value = "";
+        sites.querySelectorAll("input").forEach((i) => { i.checked = false; });
+        loadLists();
+      } catch (e) { showError(form, e); }
+      finally { busy(sendBtn, false); }
+    });
+
+    const lists = h("div", {});
+    const loadLists = async () => {
+      let d;
+      try { d = await api("GET", "/api/people"); } catch { return; }
+      lists.replaceChildren(
+        h("div", { class: "table-wrap" }, h("table", { class: "table" },
+          h("thead", {}, h("tr", {}, ["Person", "Role", "Private sites", "Last signed in", ""].map((x) => h("th", { scope: "col" }, x)))),
+          h("tbody", {}, d.people.map((p) => personRow(p, d.me, loadLists))))),
+        d.invites.length ? h("section", { class: "section mt" },
+          h("header", {}, h("h2", {}, "Waiting to join")),
+          h("div", { class: "table-wrap" }, h("table", { class: "table" },
+            h("thead", {}, h("tr", {}, ["Username", "Role", "Invited by", "Expires", ""].map((x) => h("th", { scope: "col" }, x)))),
+            h("tbody", {}, d.invites.map((i) => h("tr", {},
+              h("td", {}, i.username), h("td", {}, i.role === "admin" ? "Admin" : "Member"), h("td", {}, i.createdBy),
+              h("td", {}, fmtTime(i.expiresAt)),
+              h("td", {}, h("button", { class: "btn small", type: "button", onclick: async () => {
+                try { await api("DELETE", `/api/invites/${i.id}`); toast("Invite cancelled."); loadLists(); }
+                catch (e) { toast(e.message, "error"); }
+              } }, "Cancel invite")))))))) : null);
+    };
+
+    body.replaceChildren(
+      h("section", { class: "section" }, h("header", {}, h("h2", {}, "Invite someone"),
+        h("p", {}, "They choose their own password and set up an authenticator app. You never see either.")), form),
+      lists);
+    loadLists();
+  };
+  await load();
+}
+
+function personRow(p, me, reload) {
+  const self = p.id === me;
+  const role = h("select", { "aria-label": `Role for ${p.username}`, disabled: self },
+    h("option", { value: "member" }, "Member"), h("option", { value: "admin" }, "Admin"));
+  role.value = p.role;
+  const save = async (changes, msg) => {
+    try {
+      await api("PUT", `/api/people/${p.id}`, { role: p.role, disabled: p.disabled, ...changes });
+      toast(msg);
+    } catch (e) { toast(e.message, "error"); }
+    reload();
+  };
+  role.addEventListener("change", () => save({ role: role.value }, `${p.username} is now ${role.value === "admin" ? "an admin" : "a member"}.`));
+  return h("tr", { class: p.disabled ? "row-off" : "" },
+    h("td", {}, h("b", {}, p.username), self ? h("div", { class: "muted" }, "You") : null, p.disabled ? h("div", { class: "err" }, "Disabled") : null),
+    h("td", {}, role),
+    h("td", {}, p.sites.length ? h("div", { class: "mono small-list" }, p.sites.map((x) => h("div", {}, x))) : h("span", { class: "muted" }, "None")),
+    h("td", {}, ago(p.lastLoginAt)),
+    h("td", {}, self ? null : h("div", { class: "row" },
+      h("button", { class: "btn small", type: "button", onclick: () =>
+        save({ disabled: !p.disabled }, p.disabled ? `${p.username} can sign in again.` : `${p.username} is disabled and signed out everywhere.`) },
+        p.disabled ? "Enable" : "Disable"),
+      h("button", { class: "btn small danger", type: "button", onclick: async () => {
+        if (!(await confirmDialog(`Remove ${p.username}?`, "They're signed out everywhere and taken off every site. This can't be undone.", "Remove"))) return;
+        try { await api("DELETE", `/api/people/${p.id}`); toast(`${p.username} removed.`); }
+        catch (e) { toast(e.message, "error"); }
+        reload();
+      } }, "Remove"))));
+}
+
 // ---------- activity ----------
 const actionText = {
   "setup.complete": "Created the admin account", login: "Signed in", logout: "Signed out",
@@ -832,6 +1001,8 @@ const actionText = {
   "account.password": "Changed password", "account.recovery_codes": "Made new recovery codes",
   "session.revoke": "Signed out a device", "session.revoke_others": "Signed out other devices",
   "admin.reset": "Reset the admin account",
+  "user.invite": "Invited someone", "user.invite_cancel": "Cancelled an invite", "user.joined": "Joined",
+  "user.update": "Changed someone's access", "user.delete": "Removed someone", "access.denied": "Was refused access",
 };
 async function activityPage() {
   const body = h("div", { "aria-busy": "true" });

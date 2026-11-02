@@ -15,6 +15,7 @@ type Session struct {
 	ID         int64
 	TokenHash  []byte
 	UserID     int64
+	Host       string // the site this session is valid on; "" for the dashboard
 	CreatedAt  time.Time
 	LastSeenAt time.Time
 	ExpiresAt  time.Time
@@ -25,9 +26,9 @@ type Session struct {
 // CreateSession stores a new session.
 func (s *Store) CreateSession(ctx context.Context, sess *Session) error {
 	res, err := s.db.ExecContext(ctx, `
-INSERT INTO sessions (token_hash, user_id, created_at, last_seen_at, expires_at, ip, user_agent)
-VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		sess.TokenHash, sess.UserID, sess.CreatedAt.Unix(), sess.LastSeenAt.Unix(), sess.ExpiresAt.Unix(), sess.IP, sess.UserAgent)
+INSERT INTO sessions (token_hash, user_id, host, created_at, last_seen_at, expires_at, ip, user_agent)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		sess.TokenHash, sess.UserID, sess.Host, sess.CreatedAt.Unix(), sess.LastSeenAt.Unix(), sess.ExpiresAt.Unix(), sess.IP, sess.UserAgent)
 	if err != nil {
 		return err
 	}
@@ -35,12 +36,12 @@ VALUES (?, ?, ?, ?, ?, ?, ?)`,
 	return err
 }
 
-const sessionCols = `id, token_hash, user_id, created_at, last_seen_at, expires_at, ip, user_agent`
+const sessionCols = `id, token_hash, user_id, host, created_at, last_seen_at, expires_at, ip, user_agent`
 
 func scanSession(row interface{ Scan(...any) error }) (*Session, error) {
 	var x Session
 	var c, l, e int64
-	if err := row.Scan(&x.ID, &x.TokenHash, &x.UserID, &c, &l, &e, &x.IP, &x.UserAgent); err != nil {
+	if err := row.Scan(&x.ID, &x.TokenHash, &x.UserID, &x.Host, &c, &l, &e, &x.IP, &x.UserAgent); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}

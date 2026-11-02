@@ -252,3 +252,17 @@ dialog::backdrop { background: rgb(10 20 30 / .45); }
 .nowrap { white-space: nowrap; }
 .wrap-any { overflow-wrap: anywhere; }
 .narrow { max-width: 70ch; }
+
+/* people picker in the route editor */
+.people-pick { display: flex; flex-direction: column; gap: .15rem; margin: -.4rem 0 .75rem 3.1rem; max-height: 16rem; overflow: auto; }
+.pick { display: flex; align-items: center; gap: .6rem; padding: .35rem .5rem; border-radius: var(--radius-s); cursor: pointer; }
+.pick:hover { background: var(--panel-2); }
+.pick .muted { margin-left: auto; font-size: .85rem; }
+.warn-inline.flush { margin-left: 3.1rem; }
+@media (max-width: 640px) { .people-pick, .warn-inline.flush { margin-left: 0; } }
+.people-pick.inset { margin: 0; border: 1px solid var(--line); border-radius: var(--radius-s); padding: .35rem; background: var(--panel); }
+.invite-link { margin-top: 1.25rem; padding: 1rem 1.1rem; border-radius: var(--radius-m); background: var(--panel-2); border: 1px solid var(--line); }
+.invite-link input { flex: 1 1 18rem; }
+.warn-inline.flush0 { margin: .75rem 0 0; }
+.row-off td { opacity: .65; }
+.small-list { font-size: .85rem; }

@@ -7,6 +7,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Added
 
+- Zero-trust access (brought forward from Milestone 4).
+  - Routes are private by default; public is an explicit per-route choice. Missing or unknown access settings are treated as private.
+  - Every request to a private site is checked: a session for that exact site, an enabled account, and a place on the site's access list. Revocation and disabling take effect on the next request.
+  - Built-in sign-in portal at `/.ryprox/` on private sites (password + authenticator), with safe return to the requested page.
+  - People: invite links (single-use, 7 days, token kept out of URLs sent to servers), member and admin roles, disable, remove. At least one admin always remains; admins can't lock themselves out.
+  - Members can't use the dashboard. Sessions are bound to one site; cookies are stripped before forwarding; a trustworthy `X-RyProx-User` header is passed to apps and forged copies removed.
+  - Passwords are never accepted over plain HTTP from other machines. User IDs are never reused, and removed users are taken off every access list.
 - Milestone 1: core proxy and admin dashboard.
   - Routes managed entirely from the dashboard, applied live with no restart; invalid changes are never saved.
   - Multiple services per route with round-robin or failover, health checks, and passive failure detection.

@@ -65,7 +65,7 @@ func TestOnlyOneFirstUser(t *testing.T) {
 	if ok != 1 {
 		t.Fatalf("%d users created, want exactly 1", ok)
 	}
-	if n, _ := s.CountUsers(ctx); n != 1 {
+	if n, _ := s.CountAdmins(ctx); n != 1 {
 		t.Fatalf("count = %d", n)
 	}
 }
@@ -219,5 +219,155 @@ func TestSettingsAndAudit(t *testing.T) {
 	list, _ := s.ListAudit(ctx, 10)
 	if len(list) != 2 || list[0].Action != "two" {
 		t.Fatalf("audit = %v", list)
+	}
+}
+
+func TestInvitesAreSingleUse(t *testing.T) {
+	s := newTestStore(t)
+	ctx := t.Context()
+	admin := &User{Username: "admin", PasswordHash: "h", TOTPSecret: "s"}
+	_ = s.CreateFirstUser(ctx, admin)
+
+	inv := &Invite{TokenHash: []byte("tok"), Username: "Sam", Role: RoleMember, CreatedBy: "admin",
+		CreatedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour)}
+	if err := s.CreateInvite(ctx, inv); err != nil {
+		t.Fatal(err)
+	}
+	// Can't invite a name that's already a user.
+	if err := s.CreateInvite(ctx, &Invite{TokenHash: []byte("x"), Username: "ADMIN", Role: RoleMember,
+		ExpiresAt: time.Now().Add(time.Hour)}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("want ErrConflict, got %v", err)
+	}
+	u := &User{PasswordHash: "h", TOTPSecret: "s"}
+	if _, err := s.AcceptInvite(ctx, []byte("tok"), u); err != nil {
+		t.Fatal(err)
+	}
+	if u.Username != "Sam" || u.Role != RoleMember {
+		t.Fatalf("got %+v", u)
+	}
+	if _, err := s.AcceptInvite(ctx, []byte("tok"), &User{}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("invite used twice: %v", err)
+	}
+	// Expired invites don't work.
+	_ = s.CreateInvite(ctx, &Invite{TokenHash: []byte("old"), Username: "old", Role: RoleMember,
+		ExpiresAt: time.Now().Add(-time.Minute)})
+	if _, err := s.GetInviteByHash(ctx, []byte("old")); !errors.Is(err, ErrNotFound) {
+		t.Fatal("expired invite found")
+	}
+	if _, err := s.AcceptInvite(ctx, []byte("old"), &User{}); !errors.Is(err, ErrNotFound) {
+		t.Fatal("expired invite accepted")
+	}
+}
+
+func TestLastAdminProtection(t *testing.T) {
+	s := newTestStore(t)
+	ctx := t.Context()
+	admin := &User{Username: "admin", PasswordHash: "h", TOTPSecret: "s"}
+	_ = s.CreateFirstUser(ctx, admin)
+	if err := s.UpdateUserAccess(ctx, admin.ID, RoleMember, false); !errors.Is(err, ErrLastAdmin) {
+		t.Fatalf("demoted the last admin: %v", err)
+	}
+	if err := s.UpdateUserAccess(ctx, admin.ID, RoleAdmin, true); !errors.Is(err, ErrLastAdmin) {
+		t.Fatalf("disabled the last admin: %v", err)
+	}
+	if err := s.DeleteUser(ctx, admin.ID); !errors.Is(err, ErrLastAdmin) {
+		t.Fatalf("deleted the last admin: %v", err)
+	}
+	got, _ := s.GetUser(ctx, admin.ID)
+	if got.Role != RoleAdmin || got.Disabled {
+		t.Fatal("failed change was not rolled back")
+	}
+}
+
+func TestDisablingSignsOut(t *testing.T) {
+	s := newTestStore(t)
+	ctx := t.Context()
+	_ = s.CreateFirstUser(ctx, &User{Username: "admin", PasswordHash: "h", TOTPSecret: "s"})
+	_ = s.CreateInvite(ctx, &Invite{TokenHash: []byte("t"), Username: "m", Role: RoleMember, ExpiresAt: time.Now().Add(time.Hour)})
+	m := &User{PasswordHash: "h", TOTPSecret: "s"}
+	_, _ = s.AcceptInvite(ctx, []byte("t"), m)
+	n := time.Now()
+	_ = s.CreateSession(ctx, &Session{TokenHash: []byte("ms"), UserID: m.ID, Host: "app.example.com", CreatedAt: n, LastSeenAt: n, ExpiresAt: n.Add(time.Hour)})
+	if err := s.UpdateUserAccess(ctx, m.ID, RoleMember, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.GetSessionByHash(ctx, []byte("ms")); !errors.Is(err, ErrNotFound) {
+		t.Fatal("disabled user still has a session")
+	}
+	// reset-admin keeps members.
+	if err := s.DeleteAllAdmins(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := s.CountAdmins(ctx); n != 0 {
+		t.Fatal("admins remain")
+	}
+	if _, err := s.GetUser(ctx, m.ID); err != nil {
+		t.Fatal("member removed by reset-admin")
+	}
+}
+
+func TestUpgradeFromSchemaV1(t *testing.T) {
+	// A database created by the first release must upgrade cleanly, and its
+	// admin must stay an admin.
+	path := filepath.Join(t.TempDir(), "v1.db")
+	all := migrations
+	migrations = all[:1]
+	s, err := Open(t.Context(), path)
+	if err != nil {
+		migrations = all
+		t.Fatal(err)
+	}
+	_, err = s.db.ExecContext(t.Context(),
+		"INSERT INTO users (username, password_hash, totp_secret, created_at, updated_at) VALUES ('old', 'h', 's', 1, 1)")
+	_ = s.Close()
+	migrations = all
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s, err = Open(t.Context(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+	if v, _ := s.SchemaVersion(t.Context()); v != len(migrations) {
+		t.Fatalf("schema v%d", v)
+	}
+	u, err := s.GetUserByUsername(t.Context(), "old")
+	if err != nil || u.Role != RoleAdmin || u.Disabled {
+		t.Fatalf("upgraded user: %+v, %v", u, err)
+	}
+	if n, _ := s.CountAdmins(t.Context()); n != 1 {
+		t.Fatal("upgraded admin not counted")
+	}
+}
+
+func TestDeletedUserIDsAreNeverReused(t *testing.T) {
+	s := newTestStore(t)
+	ctx := t.Context()
+	_ = s.CreateFirstUser(ctx, &User{Username: "admin", PasswordHash: "h", TOTPSecret: "s"})
+	invite := func(name string) *User {
+		_ = s.CreateInvite(ctx, &Invite{TokenHash: []byte(name), Username: name, Role: RoleMember, ExpiresAt: time.Now().Add(time.Hour)})
+		u := &User{PasswordHash: "h", TOTPSecret: "s"}
+		if _, err := s.AcceptInvite(ctx, []byte(name), u); err != nil {
+			t.Fatal(err)
+		}
+		return u
+	}
+	old := invite("old")
+	r := &Route{Hostname: "p.example.com", Enabled: true, Config: RouteConfig{Access: Access{Mode: AccessPrivate, Users: []int64{old.ID}}}}
+	if _, err := s.CreateRoute(ctx, r, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteUser(ctx, old.ID); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := s.GetRoute(ctx, r.ID)
+	if len(got.Config.Access.Users) != 0 {
+		t.Fatalf("deleted user still on access list: %v", got.Config.Access.Users)
+	}
+	newcomer := invite("new")
+	if newcomer.ID == old.ID {
+		t.Fatal("a new user received a deleted user's ID")
 	}
 }

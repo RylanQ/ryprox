@@ -71,6 +71,10 @@ func (s *Server) readRoute(w http.ResponseWriter, r *http.Request) (*store.Route
 		s.writeErr(w, err)
 		return nil, false
 	}
+	if err := s.checkAccessUsers(r, rt); err != nil {
+		s.writeErr(w, err)
+		return nil, false
+	}
 	return rt, true
 }
 

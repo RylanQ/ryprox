@@ -44,7 +44,8 @@ func newEngine(t *testing.T, routes ...store.Route) *Engine {
 }
 
 func route(id int64, host string, targets ...string) store.Route {
-	r := store.Route{ID: id, Hostname: host, Enabled: true, Config: store.RouteConfig{LoadBalancing: "round_robin", Websockets: true}}
+	r := store.Route{ID: id, Hostname: host, Enabled: true, Config: store.RouteConfig{LoadBalancing: "round_robin", Websockets: true,
+		Access: store.Access{Mode: store.AccessPublic}}}
 	for _, u := range targets {
 		r.Config.Targets = append(r.Config.Targets, store.Target{URL: u})
 	}
@@ -346,5 +347,85 @@ func TestHealthChecks(t *testing.T) {
 	st := TestTarget(t.Context(), backend.URL+"/health", false)
 	if st.State != StateDown || st.LastError != "HTTP 503" {
 		t.Fatalf("TestTarget = %+v", st)
+	}
+}
+
+// fakeGate lets "alice" in when she presents the right cookie.
+type fakeGate struct{}
+
+func (fakeGate) Authorize(w http.ResponseWriter, r *http.Request, _ *store.Route) (string, bool) {
+	if c, err := r.Cookie("ryprox-access"); err == nil && c.Value == "alice-session" {
+		return "alice", true
+	}
+	http.Redirect(w, r, PortalPrefix+"login", http.StatusFound)
+	return "", false
+}
+
+func (fakeGate) Portal(w http.ResponseWriter, _ *http.Request, _ *store.Route) {
+	_, _ = fmt.Fprint(w, "portal")
+}
+
+func cookieEcho(t *testing.T) *httptest.Server {
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprintf(w, "cookie=%s\nuser=%s\nspoof=%s\n", r.Header.Get("Cookie"), r.Header.Get(UserHeader), r.Header.Get("X-Ryprox-Role"))
+	}))
+	t.Cleanup(s.Close)
+	return s
+}
+
+func TestPrivateRouteFailsClosedWithoutGate(t *testing.T) {
+	b := cookieEcho(t)
+	r := route(1, "p.example.com", b.URL)
+	r.Config.Access = store.Access{} // missing mode = private
+	e := newEngine(t, r)
+	if rec := do(t, e, "p.example.com", "/", nil); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("private route without a gate: %d", rec.Code)
+	}
+}
+
+func TestPrivateRouteUsesGate(t *testing.T) {
+	b := cookieEcho(t)
+	r := route(1, "p.example.com", b.URL)
+	r.Config.Access = store.Access{Mode: store.AccessPrivate}
+	e := newEngine(t, r)
+	e.SetGate(fakeGate{})
+
+	// No session: redirected to sign in; the backend is never reached.
+	if rec := do(t, e, "p.example.com", "/secret", nil); rec.Code != http.StatusFound {
+		t.Fatalf("anonymous request: %d", rec.Code)
+	}
+	// Portal paths are handled by RyProx, not the backend.
+	if body := do(t, e, "p.example.com", "/.ryprox/login", nil).Body.String(); body != "portal" {
+		t.Fatalf("portal: %q", body)
+	}
+	// Signed in: the backend gets the user, but never RyProx's cookie, and
+	// a forged identity header is removed.
+	rec := do(t, e, "p.example.com", "/", map[string]string{
+		"Cookie":        "theme=dark; ryprox-access=alice-session; __Host-ryprox=x; other=1",
+		UserHeader:      "mallory",
+		"X-Ryprox-Role": "admin",
+	})
+	body := rec.Body.String()
+	if field(body, "user") != "alice" {
+		t.Fatalf("user header: %q", body)
+	}
+	if c := field(body, "cookie"); c != "theme=dark; other=1" {
+		t.Fatalf("cookies reaching backend: %q", c)
+	}
+	if field(body, "spoof") != "" {
+		t.Fatal("forged X-Ryprox-* header reached the backend")
+	}
+}
+
+func TestPublicRouteStripsForgedIdentity(t *testing.T) {
+	b := cookieEcho(t)
+	e := newEngine(t, route(1, "pub.example.com", b.URL))
+	body := do(t, e, "pub.example.com", "/.ryprox/login", map[string]string{UserHeader: "admin"}).Body.String()
+	if field(body, "user") != "" {
+		t.Fatal("public route forwarded a forged user header")
+	}
+	// On public routes, /.ryprox/ belongs to the app.
+	if !strings.Contains(body, "cookie=") {
+		t.Fatal("public route didn't forward /.ryprox/ to the backend")
 	}
 }

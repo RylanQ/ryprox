@@ -70,7 +70,9 @@ var migrations = []string{
 	// 1: initial schema
 	`
 CREATE TABLE users (
-	id                INTEGER PRIMARY KEY,
+	-- AUTOINCREMENT: a deleted user's ID is never reused, so a new person
+	-- can't inherit someone else's access.
+	id                INTEGER PRIMARY KEY AUTOINCREMENT,
 	username          TEXT    NOT NULL UNIQUE COLLATE NOCASE,
 	password_hash     TEXT    NOT NULL,
 	totp_secret       TEXT    NOT NULL,
@@ -111,6 +113,24 @@ CREATE TABLE audit_log (
 	ip     TEXT    NOT NULL DEFAULT ''
 );
 CREATE INDEX audit_at ON audit_log(at);
+`,
+	// 2: people and zero-trust access
+	`
+ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'admin';
+ALTER TABLE users ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE users ADD COLUMN last_login_at INTEGER NOT NULL DEFAULT 0;
+-- A session is only valid on the site it was created for ('' = dashboard).
+ALTER TABLE sessions ADD COLUMN host TEXT NOT NULL DEFAULT '';
+CREATE TABLE invites (
+	id         INTEGER PRIMARY KEY,
+	token_hash BLOB    NOT NULL UNIQUE,
+	username   TEXT    NOT NULL UNIQUE COLLATE NOCASE,
+	role       TEXT    NOT NULL,
+	routes     TEXT    NOT NULL DEFAULT '[]', -- route IDs to grant on acceptance
+	created_by TEXT    NOT NULL,
+	created_at INTEGER NOT NULL,
+	expires_at INTEGER NOT NULL
+);
 `,
 }
 

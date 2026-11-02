@@ -151,7 +151,7 @@ func resetAdmin(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 	if !*yes {
-		_, _ = fmt.Fprintln(stdout, "This removes the admin account and signs everyone out. Routes and settings are kept.")
+		_, _ = fmt.Fprintln(stdout, "This removes all admin accounts. Routes, settings and other people's accounts are kept.")
 		_, _ = fmt.Fprintln(stdout, "Run again with --yes to confirm, then restart RyProx and use the new setup code.")
 		return nil
 	}
@@ -164,10 +164,10 @@ func resetAdmin(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 	defer func() { _ = st.Close() }()
-	if err := st.DeleteAllUsers(context.Background()); err != nil {
+	if err := st.DeleteAllAdmins(context.Background()); err != nil {
 		return err
 	}
-	_, _ = fmt.Fprintln(stdout, "Admin account removed. Restart RyProx; it will print a new setup code.")
+	_, _ = fmt.Fprintln(stdout, "Admin accounts removed. Restart RyProx; it will print a new setup code.")
 	return nil
 }
 

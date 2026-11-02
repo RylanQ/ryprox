@@ -74,6 +74,7 @@ func Run(ctx context.Context, o Options) error {
 		return engine.HasHost(host)
 	}, log)
 	adm.Certs = cm
+	engine.SetGate(adm) // private routes check every request against the access lists
 	if o.ACMEDirectory != "" {
 		if err := cm.UseCustomServer(o.ACMEDirectory, o.ACMECAFile); err != nil {
 			return err

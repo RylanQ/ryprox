@@ -51,11 +51,15 @@ type Server struct {
 	mu        sync.Mutex
 	setupHash []byte // hash of the one-time setup code; nil once set up
 	pending   map[string]pendingLogin
+
+	portalOnce sync.Once
+	portal     http.Handler
 }
 
 type pendingLogin struct {
 	userID  int64
 	ip      string
+	realm   realm
 	expires time.Time
 }
 
@@ -70,7 +74,7 @@ func New(ctx context.Context, s *Server) (setupCode string, err error) {
 		return "", err
 	}
 	s.settings.Store(&st)
-	n, err := s.Store.CountUsers(ctx)
+	n, err := s.Store.CountAdmins(ctx)
 	if err != nil {
 		return "", err
 	}
@@ -124,6 +128,17 @@ func (s *Server) Handler() http.Handler {
 	priv("DELETE /api/account/sessions/{id}", s.handleDeleteSession)
 	priv("POST /api/account/sessions/revoke-others", s.handleRevokeOthers)
 	priv("POST /api/account/recovery-codes", s.handleNewRecoveryCodes)
+	priv("GET /api/people", s.handleListPeople)
+	priv("POST /api/invites", s.handleCreateInvite)
+	priv("DELETE /api/invites/{id}", s.handleDeleteInvite)
+	priv("PUT /api/people/{id}", s.handleUpdatePerson)
+	priv("DELETE /api/people/{id}", s.handleDeletePerson)
+
+	// The sign-in portal also works here, so invites can be accepted on the
+	// dashboard's own address.
+	mux.Handle(proxy.PortalPrefix, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.Portal(w, r, nil)
+	}))
 
 	mux.HandleFunc("/api/", func(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, http.StatusNotFound, "unknown API endpoint")
@@ -193,41 +208,63 @@ func (s *Server) csrfProtect(next http.Handler) http.Handler {
 
 // --- sessions ----------------------------------------------------------
 
-func cookieName(r *http.Request) string {
-	if r.TLS != nil {
-		return "__Host-ryprox" // __Host- cookies must be Secure and host-only
+// A realm is where a session is valid: the dashboard (host "") or one
+// private site. A session from one realm is never accepted in another, so
+// signing in to one site doesn't open the others, or the dashboard.
+type realm struct{ host string }
+
+var dashboard = realm{}
+
+func (rl realm) cookieName(r *http.Request) string {
+	name := "ryprox"
+	if rl.host != "" {
+		name = "ryprox-access"
 	}
-	return "ryprox"
+	if r.TLS != nil {
+		return "__Host-" + name // __Host- cookies must be Secure and host-only
+	}
+	return name
 }
 
-func (s *Server) setSessionCookie(w http.ResponseWriter, r *http.Request, token string, expires time.Time) {
-	// Secure is only false on the plain-HTTP admin listener, which is meant to be
-	// reached on localhost (directly or through an SSH tunnel).
+// The dashboard uses Strict cookies. Sites use Lax, so following a link to a
+// site (e.g. from a chat message) arrives signed in.
+func (rl realm) sameSite() http.SameSite {
+	if rl.host == "" {
+		return http.SameSiteStrictMode
+	}
+	return http.SameSiteLaxMode
+}
+
+func (s *Server) setSessionCookie(w http.ResponseWriter, r *http.Request, rl realm, token string, expires time.Time) {
+	// Secure is only false on plain HTTP, which RyProx only allows from the
+	// server itself (the local dashboard, or an SSH tunnel).
 	http.SetCookie(w, &http.Cookie{ //nolint:gosec // see above
-		Name:     cookieName(r),
+		Name:     rl.cookieName(r),
 		Value:    token,
 		Path:     "/",
 		Expires:  expires,
 		HttpOnly: true,
 		Secure:   r.TLS != nil,
-		SameSite: http.SameSiteStrictMode,
+		SameSite: rl.sameSite(),
 	})
 }
 
-func (s *Server) clearSessionCookie(w http.ResponseWriter, r *http.Request) {
-	http.SetCookie(w, &http.Cookie{Name: cookieName(r), Value: "", Path: "/", MaxAge: -1, //nolint:gosec // as above
-		HttpOnly: true, Secure: r.TLS != nil, SameSite: http.SameSiteStrictMode})
+func (s *Server) clearSessionCookie(w http.ResponseWriter, r *http.Request, rl realm) {
+	http.SetCookie(w, &http.Cookie{Name: rl.cookieName(r), Value: "", Path: "/", MaxAge: -1, //nolint:gosec // as above
+		HttpOnly: true, Secure: r.TLS != nil, SameSite: rl.sameSite()})
 }
 
-// currentSession returns the logged-in user, or nil.
-func (s *Server) currentSession(r *http.Request) (*store.User, *store.Session) {
-	c, err := r.Cookie(cookieName(r))
+// sessionFor returns the signed-in user for this realm, or nil. Everything is
+// re-checked on every request: expiry, idle time, the realm, whether the
+// account is disabled, and (for the dashboard) the admin role.
+func (s *Server) sessionFor(r *http.Request, rl realm) (*store.User, *store.Session) {
+	c, err := r.Cookie(rl.cookieName(r))
 	if err != nil || c.Value == "" || len(c.Value) > 100 {
 		return nil, nil
 	}
 	ctx := r.Context()
 	sess, err := s.Store.GetSessionByHash(ctx, auth.HashToken(c.Value))
-	if err != nil {
+	if err != nil || sess.Host != rl.host {
 		return nil, nil
 	}
 	now := time.Now()
@@ -236,13 +273,21 @@ func (s *Server) currentSession(r *http.Request) (*store.User, *store.Session) {
 		return nil, nil
 	}
 	u, err := s.Store.GetUser(ctx, sess.UserID)
-	if err != nil {
+	if err != nil || u.Disabled {
+		return nil, nil
+	}
+	if rl == dashboard && u.Role != store.RoleAdmin {
 		return nil, nil
 	}
 	if now.Sub(sess.LastSeenAt) > time.Minute {
 		_ = s.Store.TouchSession(ctx, sess.ID, now)
 	}
 	return u, sess
+}
+
+// currentSession returns the signed-in dashboard admin, or nil.
+func (s *Server) currentSession(r *http.Request) (*store.User, *store.Session) {
+	return s.sessionFor(r, dashboard)
 }
 
 func (s *Server) requireSession(h func(http.ResponseWriter, *http.Request, *store.User, *store.Session)) http.Handler {
@@ -256,7 +301,7 @@ func (s *Server) requireSession(h func(http.ResponseWriter, *http.Request, *stor
 	})
 }
 
-func (s *Server) startSession(w http.ResponseWriter, r *http.Request, userID int64) error {
+func (s *Server) startSession(w http.ResponseWriter, r *http.Request, userID int64, rl realm) error {
 	token, err := auth.NewToken()
 	if err != nil {
 		return err
@@ -266,12 +311,13 @@ func (s *Server) startSession(w http.ResponseWriter, r *http.Request, userID int
 	if len(ua) > 300 {
 		ua = ua[:300]
 	}
-	sess := &store.Session{TokenHash: auth.HashToken(token), UserID: userID, CreatedAt: now, LastSeenAt: now,
+	sess := &store.Session{TokenHash: auth.HashToken(token), UserID: userID, Host: rl.host, CreatedAt: now, LastSeenAt: now,
 		ExpiresAt: now.Add(sessionAbsolute), IP: clientIP(r), UserAgent: ua}
 	if err := s.Store.CreateSession(r.Context(), sess); err != nil {
 		return err
 	}
-	s.setSessionCookie(w, r, token, sess.ExpiresAt)
+	_ = s.Store.RecordLogin(r.Context(), userID)
+	s.setSessionCookie(w, r, rl, token, sess.ExpiresAt)
 	return nil
 }
 

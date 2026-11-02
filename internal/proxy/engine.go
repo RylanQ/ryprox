@@ -30,6 +30,66 @@ type Engine struct {
 	snap   atomic.Pointer[snapshot]
 	health *HealthChecker
 	log    *slog.Logger
+	gate   atomic.Pointer[gateBox]
+}
+
+// PortalPrefix is the path RyProx reserves on private sites for its own
+// sign-in pages. Requests under it never reach the backend.
+const PortalPrefix = "/.ryprox/"
+
+// Gate decides who may open a private route.
+type Gate interface {
+	// Authorize checks the request's session against the route's access
+	// list. If access is refused it writes the response (a sign-in redirect
+	// or an error) and returns ok=false.
+	Authorize(w http.ResponseWriter, r *http.Request, route *store.Route) (username string, ok bool)
+	// Portal serves RyProx's sign-in pages under PortalPrefix.
+	Portal(w http.ResponseWriter, r *http.Request, route *store.Route)
+}
+
+type gateBox struct{ g Gate }
+
+// SetGate installs the access gate. Until one is set, private routes refuse
+// every request (fail closed).
+func (e *Engine) SetGate(g Gate) { e.gate.Store(&gateBox{g}) }
+
+// Cookies RyProx uses for sign-in. They are removed before a request is
+// forwarded, so a backend can never see (or steal) a RyProx session.
+var ryproxCookies = map[string]bool{
+	"__Host-ryprox": true, "ryprox": true, "__Host-ryprox-access": true, "ryprox-access": true,
+}
+
+// UserHeader carries the signed-in username to the backend. Any copy sent
+// by a visitor is removed first, so backends can trust it.
+const UserHeader = "X-Ryprox-User"
+
+func stripRyproxCookies(h http.Header) {
+	vals := h.Values("Cookie")
+	if len(vals) == 0 {
+		return
+	}
+	var kept []string
+	for _, line := range vals {
+		for _, part := range strings.Split(line, ";") {
+			name, _, _ := strings.Cut(strings.TrimSpace(part), "=")
+			if name == "" || ryproxCookies[name] {
+				continue
+			}
+			kept = append(kept, strings.TrimSpace(part))
+		}
+	}
+	h.Del("Cookie")
+	if len(kept) > 0 {
+		h.Set("Cookie", strings.Join(kept, "; "))
+	}
+}
+
+func stripRyproxHeaders(h http.Header) {
+	for name := range h {
+		if strings.HasPrefix(http.CanonicalHeaderKey(name), "X-Ryprox-") {
+			h.Del(name)
+		}
+	}
 }
 
 type snapshot struct {
@@ -261,6 +321,24 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		WritePage(w, http.StatusNotFound, "Not found", "No site is configured at this address.")
 		return
 	}
+	stripRyproxHeaders(r.Header)
+	if !lr.route.Config.Access.IsPublic() {
+		gb := e.gate.Load()
+		if gb == nil || gb.g == nil {
+			WritePage(w, http.StatusServiceUnavailable, "Not available", "This site is private and sign-in isn't available right now.")
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, PortalPrefix) {
+			gb.g.Portal(w, r, &lr.route)
+			return
+		}
+		user, ok := gb.g.Authorize(w, r, &lr.route)
+		if !ok {
+			return
+		}
+		r.Header.Set(UserHeader, user)
+	}
+	stripRyproxCookies(r.Header)
 	if isUpgrade(r) && !lr.route.Config.Websockets {
 		WritePage(w, http.StatusForbidden, "Not allowed", "WebSocket connections are turned off for this site.")
 		return

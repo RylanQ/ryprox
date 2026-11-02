@@ -196,6 +196,28 @@ func NormalizeRoute(r *store.Route) error {
 	if c.ResponseHeaders, err = normalizeHeaderRules("responseHeaders", c.ResponseHeaders); err != nil {
 		return err
 	}
+	switch c.Access.Mode {
+	case "", store.AccessPrivate:
+		c.Access.Mode = store.AccessPrivate
+	case store.AccessPublic:
+	default:
+		return fieldErr("access.mode", "choose private or public")
+	}
+	if len(c.Access.Users) > 10000 {
+		return fieldErr("access.users", "too many people")
+	}
+	seenUsers := map[int64]bool{}
+	users := c.Access.Users[:0]
+	for _, id := range c.Access.Users {
+		if id > 0 && !seenUsers[id] {
+			seenUsers[id] = true
+			users = append(users, id)
+		}
+	}
+	c.Access.Users = users
+	if c.Access.Users == nil {
+		c.Access.Users = []int64{}
+	}
 	hc := &c.HealthCheck
 	if hc.Path == "" {
 		hc.Path = "/"

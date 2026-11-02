@@ -9,13 +9,14 @@ RyProx sends visitors from your domains (like `photos.example.com`) to services 
 3. [First-time setup](#3-first-time-setup)
 4. [Open the dashboard safely](#4-open-the-dashboard-safely)
 5. [Add your first route](#5-add-your-first-route)
-6. [Turn on HTTPS](#6-turn-on-https)
-7. [Route options explained](#7-route-options-explained)
-8. [Your account and security](#8-your-account-and-security)
-9. [Backups, updates and recovery](#9-backups-updates-and-recovery)
-10. [Troubleshooting](#10-troubleshooting)
-11. [Real-world test checklist](#11-real-world-test-checklist)
-12. [How RyProx works](#12-how-ryprox-works)
+6. [Who can open your sites (zero trust)](#6-who-can-open-your-sites-zero-trust)
+7. [Turn on HTTPS](#7-turn-on-https)
+8. [Route options explained](#8-route-options-explained)
+9. [Your account and security](#9-your-account-and-security)
+10. [Backups, updates and recovery](#10-backups-updates-and-recovery)
+11. [Troubleshooting](#11-troubleshooting)
+12. [Real-world test checklist](#12-real-world-test-checklist)
+13. [How RyProx works](#13-how-ryprox-works)
 
 ---
 
@@ -155,7 +156,8 @@ A **route** connects a domain to one or more services.
 1. Go to **Routes → Add route**.
 2. **Domain name**: e.g. `photos.example.com`. Just the name, no `https://` and no path.
 3. **Services**: the address you'd use on your own network, e.g. `http://192.168.1.10:2342`. Click **Test** to check RyProx can reach it.
-4. Click **Add route**. It's live immediately; there's nothing to restart.
+4. **Who can open this site?** New routes are **private**: only the people you tick can open them, after signing in. You're ticked to start with. See the next section.
+5. Click **Add route**. It's live immediately; there's nothing to restart.
 
 The routes page shows each route as a wire from the domain to its services:
 
@@ -169,7 +171,47 @@ The routes page shows each route as a wire from the domain to its services:
 
 Hover over a service to see its response time or the last error.
 
-## 6. Turn on HTTPS
+## 6. Who can open your sites (zero trust)
+
+RyProx follows **zero trust**: nobody is trusted because of where they connect from, and every request is checked. In practice:
+
+- **Every new route is private.** Only people you choose can open it. Making a site public is a deliberate choice you make per route.
+- **Every request is checked**, not just the first: the person's session, that their account is still enabled, and that they're still on the site's list. If you take someone off a site or disable them, their very next click is refused.
+- **Each site has its own sign-in.** Signing in to `photos.example.com` doesn't open `nas.example.com` or the dashboard. A stolen cookie from one site is useless on the others.
+- **Two steps, always**: password plus authenticator code, for everyone.
+- **Passwords are never accepted over plain HTTP** (except on the server itself). Private sites need automatic HTTPS for people to sign in from other devices.
+
+### What visitors see
+
+Someone opening a private site without being signed in gets a RyProx sign-in page (at `/.ryprox/login` on that site). After signing in they land on the page they asked for. If they're signed in but not on the list, they see a *No access* page.
+
+The `/.ryprox/` path is reserved by RyProx on private sites; it never reaches your app. On public sites it's passed through untouched.
+
+### Adding people
+
+1. Go to **People → Invite someone**.
+2. Enter a username, choose **Member** or **Admin**, and tick the sites they may open.
+3. Click **Create invite link** and send them the link. It works once, expires after 7 days, and is only shown to you once.
+4. They open it, choose their own password and set up their authenticator app. You never see either.
+
+| Role | Can do |
+| --- | --- |
+| **Member** | Open the private sites they've been given. Nothing else. |
+| **Admin** | Everything a member can, plus manage RyProx in the dashboard. |
+
+From the People page you can change someone's role, **Disable** them (signed out everywhere instantly, account kept), or **Remove** them (taken off every site too). You can't disable or remove yourself, and RyProx always keeps at least one admin.
+
+Invite links use your dashboard domain if you've set one, otherwise the address of one of your private sites. Until HTTPS is on, they only work from the server itself.
+
+### What your apps receive
+
+For private sites, RyProx tells your app who is signed in with an `X-RyProx-User` header. RyProx removes any copy of this header sent by a visitor, so apps can trust it. RyProx also removes its own sign-in cookie before forwarding, so a compromised app can never steal someone's RyProx session.
+
+### Public sites
+
+Choose **Anyone on the internet** only for things meant to be public (a blog, a status page). Make sure the app has its own login if it needs one.
+
+## 7. Turn on HTTPS
 
 1. Make sure each domain's DNS points at your server, and ports 80 and 443 are open.
 2. Go to **Settings → HTTPS** and choose **Automatic HTTPS**.
@@ -182,7 +224,7 @@ Certificates renew automatically about 30 days before they expire. Visitors to `
 
 **Choose *HTTP only*** if another proxy in front of RyProx already handles HTTPS, or for testing on a home network.
 
-## 7. Route options explained
+## 8. Route options explained
 
 - **Route is on**: switch a route off to stop serving it without deleting it. The toggle on the routes page does the same.
 - **More than one service**: *Spread requests* sends visitors to each service in turn (load balancing). *Use the first service* only uses the others if the first is down (failover).
@@ -195,7 +237,7 @@ Certificates renew automatically about 30 days before they expire. Visitors to `
 
 Every service receives `X-Forwarded-For`, `X-Forwarded-Proto`, `X-Forwarded-Host` and `X-Real-IP` with the visitor's real details. RyProx removes any of these headers the visitor sends, so they can't be faked.
 
-## 8. Your account and security
+## 9. Your account and security
 
 What RyProx does to keep you safe:
 
@@ -209,7 +251,7 @@ What RyProx does to keep you safe:
 
 If you lose your phone, sign in with a recovery code, then make new codes under **Settings → Recovery codes**.
 
-## 9. Backups, updates and recovery
+## 10. Backups, updates and recovery
 
 **Back up the data folder** (`ryprox-data` volume, or `/var/lib/ryprox`). It holds:
 
@@ -221,15 +263,17 @@ If you lose your phone, sign in with a recovery code, then make new codes under 
 
 **Updating**: run the quick-install command again. If you installed by hand, pull the new version and rebuild (`docker compose ... up -d --build`, or `make build` and restart the service). The database upgrades itself.
 
-**Locked out completely** (lost phone *and* recovery codes)? On the server, run:
+**Someone else locked out?** An admin can remove them on the People page and send a new invite.
+
+**Locked out completely** (lost phone *and* recovery codes, and no other admin)? On the server, run:
 
 ```sh
 ryprox reset-admin --yes            # or: docker compose ... run --rm ryprox reset-admin --yes
 ```
 
-then restart RyProx. Your routes and settings are kept; a new setup code is printed so you can create the account again.
+then restart RyProx. Routes, settings and members are kept; a new setup code is printed so you can create an admin account again. (You'll need to tick yourself on your private routes again.)
 
-## 10. Troubleshooting
+## 11. Troubleshooting
 
 | Problem | Likely cause and fix |
 | --- | --- |
@@ -237,13 +281,16 @@ then restart RyProx. Your routes and settings are kept; a new setup code is prin
 | Browser warns about the certificate | You're still on test certificates. Turn them off in Settings. |
 | *Service unavailable* (502) page | RyProx can't reach the service. Use **Test** in the route editor. Check the address and port, and that the service accepts connections from the RyProx server (in Docker, `localhost` means the container itself: use the host's LAN IP instead). |
 | *Not found* (404) page | No route matches that domain, or the route is switched off. |
+| *No access* page | You're signed in, but not on that site's list. An admin can tick you in the route's *Who can open this site?* section. |
+| "Signing in needs HTTPS" | Private sites only accept passwords over HTTPS. Turn on automatic HTTPS in Settings. |
+| An app or API client gets *401 Sign-in needed* | The route is private. Scripts and API clients can't sign in yet; make that route public if it has its own authentication. |
 | App loads but redirects in a loop or breaks | Turn on *Pass the original domain to the service*, and set the app's own "external URL" setting to `https://your-domain`. |
 | Live updates don't work | Make sure *Allow WebSockets* is on. |
 | "Too many attempts" | Wait for the time shown; the lockout lifts automatically. |
 | Where's the setup code? | In the logs: `docker compose ... logs ryprox` or `journalctl -u ryprox`. |
 | `bind: permission denied` on port 80/443 | Running outside Docker/systemd without permission. Use the systemd service, or `sudo setcap cap_net_bind_service=+ep /usr/local/bin/ryprox`. |
 
-## 11. Real-world test checklist
+## 12. Real-world test checklist
 
 Work through this on a real server and domain. Tick as you go.
 
@@ -256,6 +303,7 @@ Work through this on a real server and domain. Tick as you go.
 - [ ] Restarting RyProx doesn't print a new setup code
 
 **Routes over HTTP**
+- [ ] A new route is private by default, with you ticked
 - [ ] Add a route to a real service; **Test** says *Reachable*
 - [ ] `http://your-domain` shows the service
 - [ ] An unknown domain pointed at the server shows *Not found*
@@ -272,6 +320,15 @@ Work through this on a real server and domain. Tick as you go.
 - [ ] Two services + health check: stop one, its wire turns amber, visitors still get the other
 - [ ] Stop all services: wire turns red, visitors see the *Service unavailable* page
 
+**Zero trust** (needs HTTPS on)
+- [ ] Opening a private site in a private/incognito window shows the RyProx sign-in page
+- [ ] After signing in you land on the page you originally asked for
+- [ ] Invite a second person (or yourself on another device) with access to one site; they can set up their account and open it
+- [ ] Their sign-in doesn't open your other sites or the dashboard
+- [ ] Untick them on the route: their next page load says *No access*
+- [ ] Disable them on the People page: they're signed out at once
+- [ ] A public route opens without any sign-in
+
 **Security**
 - [ ] Five wrong passwords, then a lockout message
 - [ ] The same authenticator code can't be used twice
@@ -281,7 +338,7 @@ Work through this on a real server and domain. Tick as you go.
 
 Please note anything that's confusing or broken: that's the most useful feedback.
 
-## 12. How RyProx works
+## 13. How RyProx works
 
 This section is for the curious, and for anyone working on the code.
 
@@ -306,6 +363,7 @@ This section is for the curious, and for anyone working on the code.
 - **The database is the source of truth.** When you save a route, RyProx validates it, saves it inside a transaction, checks the *whole* configuration still builds, and only then commits. If anything is wrong, nothing is saved and the old configuration keeps running.
 - **Live changes, no restarts.** The proxy engine holds an immutable snapshot of all routes. A change builds a new snapshot and swaps it in atomically: requests already in flight finish on the old one, new requests use the new one. Nothing is dropped.
 - **Control plane and data plane are separate.** The dashboard and API (control plane) never handle visitors' traffic; the proxy engine (data plane) never touches the database. This is what will let RyProx run several proxy nodes from one dashboard in a later version.
+- **The access gate.** For private routes, the proxy engine asks the gate before forwarding anything: is there a session cookie, is it for *this* site, is it unexpired, is the account enabled, is the person on the site's list? Any "no" stops the request at RyProx. The sign-in portal under `/.ryprox/` is served by RyProx itself.
 - **Certificates** come from Let's Encrypt using the ACME protocol, via Go's `autocert` package. RyProx only allows certificates for domains you've configured, so a stranger pointing a random domain at your server can't make it request certificates.
 
 **Code layout**
@@ -324,4 +382,4 @@ This section is for the curious, and for anyone working on the code.
 | `internal/secrets` | Encrypts sensitive values at rest |
 | `internal/web/static` | The dashboard's HTML, CSS and JavaScript |
 
-Run the tests with `make test`. They include attack cases: forged headers, Host-header tricks, replayed codes, cross-site requests and password guessing.
+Run the tests with `make test`. They include attack cases: forged headers, Host-header tricks, replayed codes, cross-site requests, password guessing, sessions reused across sites, revoked and disabled users, and members trying to reach the dashboard.

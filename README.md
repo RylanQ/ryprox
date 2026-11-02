@@ -1,11 +1,13 @@
 # RyProx
 
-**A self-hosted reverse proxy where everything is configured from the UI, and every feature is open source.**
+**A self-hosted, zero-trust reverse proxy where everything is configured from the UI, and every feature is open source.**
 
 > **Status: alpha.** Milestone 1 is done and ready for real-world testing. Expect rough edges.
 
 ## What it does today
 
+- **Zero trust by default**: every new site is private. Only the people you choose can open it, after signing in with a password and authenticator code, and every request is checked again. Making a site public is an explicit choice.
+- **People and invites**: invite members (who can only open the sites you give them) or admins with a one-time link. Disable or remove someone and they're locked out on their next click.
 - **Routes from the dashboard**: send `photos.example.com` to `http://192.168.1.10:2342`. Changes go live instantly; no config files, no restarts.
 - **Automatic HTTPS** with Let's Encrypt, including a test-certificate mode and an optional HTTPS admin domain.
 - **Several services per route** with load balancing or failover, plus health checks.
@@ -14,7 +16,7 @@
 
 ## Coming next
 
-Sub-page routing and redirects, CrowdSec built in, login in front of any app (passkeys, SSO), tunnels for services behind CGNAT, and multiple nodes.
+Sub-page routing and redirects, CrowdSec built in, passkeys and single sign-on across sites, tunnels for services behind CGNAT, and multiple nodes.
 
 ## Get started
 

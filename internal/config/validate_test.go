@@ -65,6 +65,9 @@ func TestNormalizeRouteDefaults(t *testing.T) {
 	if err := NormalizeRoute(&r); err != nil {
 		t.Fatal(err)
 	}
+	if r.Config.Access.Mode != store.AccessPrivate {
+		t.Fatalf("new routes must be private by default, got %q", r.Config.Access.Mode)
+	}
 	if r.Hostname != "app.example.com" || r.Config.LoadBalancing != "round_robin" ||
 		r.Config.HealthCheck.Path != "/" || r.Config.HealthCheck.IntervalSeconds != 15 {
 		t.Fatalf("defaults not applied: %+v", r)
@@ -87,6 +90,7 @@ func TestNormalizeRouteRejects(t *testing.T) {
 		"bad header name": func(r *store.Route) {
 			r.Config.ResponseHeaders = []store.HeaderRule{{Action: "set", Name: "X A", Value: "x"}}
 		},
+		"bad access mode":   func(r *store.Route) { r.Config.Access.Mode = "everyone" },
 		"bad action":        func(r *store.Route) { r.Config.ResponseHeaders = []store.HeaderRule{{Action: "add", Name: "X-A"}} },
 		"health path":       func(r *store.Route) { r.Config.HealthCheck.Path = "health" },
 		"health path //":    func(r *store.Route) { r.Config.HealthCheck.Path = "//evil.com" },

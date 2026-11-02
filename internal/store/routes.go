@@ -32,6 +32,34 @@ type RouteConfig struct {
 	RequestHeaders  []HeaderRule `json:"requestHeaders"`
 	ResponseHeaders []HeaderRule `json:"responseHeaders"`
 	HealthCheck     HealthCheck  `json:"healthCheck"`
+	Access          Access       `json:"access"`
+}
+
+// Access modes.
+const (
+	AccessPrivate = "private" // only signed-in people on the list (the default)
+	AccessPublic  = "public"  // anyone on the internet
+)
+
+// Access decides who may open a route. Routes are private unless an admin
+// explicitly makes them public: zero trust means deny by default.
+type Access struct {
+	Mode  string  `json:"mode"`
+	Users []int64 `json:"users"` // who may open a private route
+}
+
+// IsPublic reports whether anyone may open the route. Anything other than
+// an explicit "public" (including a missing value) is private.
+func (a Access) IsPublic() bool { return a.Mode == AccessPublic }
+
+// Allows reports whether userID is on the route's access list.
+func (a Access) Allows(userID int64) bool {
+	for _, id := range a.Users {
+		if id == userID {
+			return true
+		}
+	}
+	return false
 }
 
 // Target is one backend server, e.g. http://10.0.0.5:8080.

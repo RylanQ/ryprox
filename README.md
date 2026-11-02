@@ -1,47 +1,72 @@
 # RyProx
 
-**A self-hosted, zero-trust reverse proxy where everything is configured from the UI, and every feature is open source.**
+A self-hosted reverse proxy with a web dashboard. It serves services from your network under your own domains, with automatic HTTPS, and requires visitors to sign in before they reach them.
 
-> **Status: alpha.** Milestone 1 is done and ready for real-world testing. Expect rough edges.
+RyProx is in early development.
 
-## What it does today
+## Install
 
-- **Zero trust by default**: every new site is private. Only the people you choose can open it, after signing in with a password and authenticator code, and every request is checked again. Making a site public is an explicit choice.
-- **People and invites**: invite members (who can only open the sites you give them) or admins with a one-time link. Disable or remove someone and they're locked out on their next click.
-- **Routes from the dashboard**: send `photos.example.com` to `http://192.168.1.10:2342`. Changes go live instantly; no config files, no restarts.
-- **Automatic HTTPS** with Let's Encrypt, including a test-certificate mode and an optional HTTPS admin domain.
-- **Several services per route** with load balancing or failover, plus health checks.
-- **WebSockets**, header rules, and support for self-signed backends.
-- **Secure by default**: two-step sign-in, single-use codes, lockout on guessing, encrypted secrets, a full activity log, and a dashboard that only listens on the server itself unless you give it a domain.
-
-## Coming next
-
-Sub-page routing and redirects, CrowdSec built in, passkeys and single sign-on across sites, tunnels for services behind CGNAT, and multiple nodes.
-
-## Get started
-
-On a Linux server, run:
+On a Linux server with ports 80 and 443 open and DNS for your domains pointing at it:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/RylanQ/ryprox/main/install.sh | sudo bash
 ```
 
-It asks a few questions, sets up HTTPS, and prints your setup code. Read the **[guide](docs/GUIDE.md)** for everything else, including installing by hand.
+The script installs RyProx with Docker or as a systemd service, sets up HTTPS, and prints a one-time setup code. Run it again to update. `--help` lists options for unattended installs.
 
-## Build from source
-
-Requires Go 1.26+.
+To run it yourself instead:
 
 ```sh
-make build     # ./bin/ryprox
-make test      # all tests, including security tests
-make dev       # run locally on high ports
+make build
+sudo setcap cap_net_bind_service=+ep bin/ryprox   # bind ports 80/443 without root
+./bin/ryprox serve --data ./data
+```
+
+## First run
+
+1. Find the setup code in the log (`docker logs ryprox` or `journalctl -u ryprox`).
+2. Open the dashboard. It listens on `127.0.0.1:8081` only, so from your own computer use `ssh -L 8081:127.0.0.1:8081 user@server` and visit <http://localhost:8081>.
+3. Enter the code, create the admin account, and scan the QR code with an authenticator app.
+4. Under **Settings**, turn on automatic HTTPS. Start with test certificates, then switch to real ones once they work.
+
+## How it works
+
+- **Routes** send a domain to one or more backend services. They're edited in the dashboard and apply immediately; invalid changes are rejected.
+- **Routes are private by default.** Visitors sign in with a password and authenticator code, and every request is checked against the route's list of allowed people. Public routes are an explicit choice.
+- **People** are invited with a single-use link. Members can open the routes they're given; admins can also use the dashboard.
+- Backends receive `X-RyProx-User` with the signed-in username, plus the usual `X-Forwarded-*` headers. Visitors can't set these themselves.
+
+## Options
+
+`ryprox serve` options, each also available as an environment variable:
+
+| Option | Variable | Default |
+| --- | --- | --- |
+| `--data` | `RYPROX_DATA` | `./data` |
+| `--http` | `RYPROX_HTTP` | `:80` |
+| `--https` | `RYPROX_HTTPS` | `:443` |
+| `--admin` | `RYPROX_ADMIN` | `127.0.0.1:8081` |
+| `--log-level` | `RYPROX_LOG_LEVEL` | `info` |
+| `--acme-directory` | `RYPROX_ACME_DIRECTORY` | Let's Encrypt |
+| `--acme-ca` | `RYPROX_ACME_CA` | |
+
+## Backups and recovery
+
+Back up `ryprox.db` and `secret.key` from the data directory together; one is useless without the other.
+
+If no admin can sign in, run `ryprox reset-admin --yes` and restart. Admin accounts are removed and a new setup code is printed; routes and members are kept.
+
+## Development
+
+```sh
+make build
+make test
 ```
 
 ## Security
 
-Please report vulnerabilities privately. See [SECURITY.md](SECURITY.md).
+Please report vulnerabilities privately through GitHub's **Security** tab rather than in a public issue.
 
-## Licence
+## License
 
 [AGPL-3.0](LICENSE)

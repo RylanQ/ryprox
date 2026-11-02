@@ -3,7 +3,7 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/RylanQ/ryprox/main/install.sh | sudo bash
 #
-# Prefer to read it first (you should!):
+# To review it before running:
 #   curl -fsSLO https://raw.githubusercontent.com/RylanQ/ryprox/main/install.sh
 #   less install.sh
 #   sudo bash install.sh
@@ -95,7 +95,7 @@ while [ $# -gt 0 ]; do
     --version) VERSION=${2:?--version needs a value}; shift ;;
     --yes|-y) YES=1 ;;
     --dry-run) DRY=1 ;;
-    -h|--help) say "See the comments at the top of install.sh, or docs/GUIDE.md."; exit 0 ;;
+    -h|--help) say "See the comments at the top of install.sh."; exit 0 ;;
     *) die "unknown option: $1 (try --help)" ;;
   esac
   shift
@@ -418,6 +418,6 @@ else
   say "    From your computer:  ssh -L $ADMIN_PORT:127.0.0.1:$ADMIN_PORT you@${PUBLIC_IP:-this-server}"
   say "    then visit           http://localhost:$ADMIN_PORT"
   say ""
-  say "  Guide: https://github.com/$REPO/blob/main/docs/GUIDE.md"
+  say "  More information: https://github.com/$REPO"
 fi
 printf '%s%s%s\n\n' "$G" "────────────────────────────────────────────────────────" "$N"

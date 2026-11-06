@@ -3,11 +3,13 @@
 package api
 
 import (
+	"encoding/csv"
 	"fmt"
 	"net/http"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/rylanq/ryprox/internal/certs"
 	"github.com/rylanq/ryprox/internal/config"
@@ -300,4 +302,36 @@ func (s *Server) handleActivity(w http.ResponseWriter, r *http.Request, _ *store
 		return
 	}
 	writeJSON(w, http.StatusOK, list)
+}
+
+// handleActivityExport downloads the audit log as CSV or JSON.
+func (s *Server) handleActivityExport(w http.ResponseWriter, r *http.Request, u *store.User, _ *store.Session) {
+	list, err := s.Store.ListAudit(r.Context(), 100000)
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	stamp := time.Now().UTC().Format("2006-01-02")
+	s.audit(r, u.Username, "activity.export", r.URL.Query().Get("format"))
+	if r.URL.Query().Get("format") == "json" {
+		w.Header().Set("Content-Disposition", `attachment; filename="ryprox-activity-`+stamp+`.json"`)
+		writeJSON(w, http.StatusOK, list)
+		return
+	}
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="ryprox-activity-`+stamp+`.csv"`)
+	cw := csv.NewWriter(w)
+	_ = cw.Write([]string{"time", "actor", "action", "detail", "ip"})
+	for _, e := range list {
+		_ = cw.Write([]string{e.At.UTC().Format(time.RFC3339), csvSafe(e.Actor), csvSafe(e.Action), csvSafe(e.Detail), csvSafe(e.IP)})
+	}
+	cw.Flush()
+}
+
+// csvSafe stops spreadsheet apps treating a cell as a formula.
+func csvSafe(v string) string {
+	if v != "" && strings.ContainsRune("=+-@\t\r", rune(v[0])) {
+		return "'" + v
+	}
+	return v
 }

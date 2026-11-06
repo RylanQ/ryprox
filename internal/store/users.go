@@ -20,6 +20,7 @@ const (
 type User struct {
 	ID              int64
 	Username        string
+	Email           string // used to match single sign-on accounts
 	Role            string
 	Disabled        bool
 	PasswordHash    string
@@ -70,13 +71,13 @@ WHERE NOT EXISTS (SELECT 1 FROM users WHERE role = 'admin' AND disabled = 0)`,
 	return err
 }
 
-const userCols = `id, username, role, disabled, password_hash, totp_secret, totp_last_counter, recovery_codes, created_at, updated_at, last_login_at`
+const userCols = `id, username, email, role, disabled, password_hash, totp_secret, totp_last_counter, recovery_codes, created_at, updated_at, last_login_at`
 
 func scanUser(row interface{ Scan(...any) error }) (*User, error) {
 	var u User
 	var codes string
 	var created, updated, last int64
-	if err := row.Scan(&u.ID, &u.Username, &u.Role, &u.Disabled, &u.PasswordHash, &u.TOTPSecret, &u.TOTPLastCounter,
+	if err := row.Scan(&u.ID, &u.Username, &u.Email, &u.Role, &u.Disabled, &u.PasswordHash, &u.TOTPSecret, &u.TOTPLastCounter,
 		&codes, &created, &updated, &last); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
@@ -121,6 +122,39 @@ func (s *Store) ListUsers(ctx context.Context) ([]User, error) {
 	return out, rows.Err()
 }
 
+// SetEmail sets the address used to match a person's single sign-on
+// account. Addresses are unique (ignoring case) so one sign-on account can
+// never match two people.
+func (s *Store) SetEmail(ctx context.Context, userID int64, email string) error {
+	if email != "" {
+		var n int
+		if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM users WHERE email = ? COLLATE NOCASE AND id != ?", email, userID).Scan(&n); err != nil {
+			return err
+		}
+		if n > 0 {
+			return ErrConflict
+		}
+	}
+	res, err := s.db.ExecContext(ctx, "UPDATE users SET email = ?, updated_at = ? WHERE id = ?", email, now(), userID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	// A changed address must not keep an old sign-on link.
+	_, err = s.db.ExecContext(ctx, "DELETE FROM identities WHERE user_id = ? AND email != ? COLLATE NOCASE", userID, email)
+	return err
+}
+
+// GetUserByEmail finds the person with this sign-on email address.
+func (s *Store) GetUserByEmail(ctx context.Context, email string) (*User, error) {
+	if email == "" {
+		return nil, ErrNotFound
+	}
+	return scanUser(s.db.QueryRowContext(ctx, "SELECT "+userCols+" FROM users WHERE email = ? COLLATE NOCASE", email))
+}
+
 // UpdatePassword replaces a user's password hash.
 func (s *Store) UpdatePassword(ctx context.Context, userID int64, hash string) error {
 	_, err := s.db.ExecContext(ctx, "UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?", hash, now(), userID)
@@ -162,6 +196,9 @@ func (s *Store) UpdateUserAccess(ctx context.Context, userID int64, role string,
 	if disabled || role != RoleAdmin {
 		// Invites only stay valid while the admin who made them still is one.
 		if err := deleteInvitesBy(ctx, tx, userID); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, "DELETE FROM tokens WHERE user_id = ? AND scope = ?", userID, ScopeAdmin); err != nil {
 			return err
 		}
 	}

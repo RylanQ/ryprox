@@ -273,3 +273,15 @@ dialog::backdrop { background: rgb(10 20 30 / .45); }
 .rule.path-rule { grid-template-columns: 9rem 1fr auto auto; align-items: center; }
 .rule.path-rule .pick { margin: 0; }
 .uptime { font-size: .75rem; color: var(--muted); margin-left: .35rem; }
+.three { display: grid; grid-template-columns: 1fr 1fr 9rem; gap: 1rem; }
+@media (max-width: 640px) { .three, .two { grid-template-columns: 1fr; } }
+.plain-list { list-style: none; margin: 0; padding: 0; }
+.plain-list li { display: flex; justify-content: space-between; align-items: center; gap: 1rem; padding: .55rem 0; border-bottom: 1px solid var(--line); }
+.plain-list li:last-child { border-bottom: 0; }
+.sso-row { border: 1px solid var(--line); border-radius: var(--radius-m); padding: 1rem; margin-bottom: 1rem; }
+.or { display: flex; align-items: center; gap: .75rem; color: var(--muted); margin: 1.25rem 0 .75rem; font-size: .85rem; }
+.or::before, .or::after { content: ""; flex: 1; border-top: 1px solid var(--line); }
+.linkish.small { font-size: .8rem; color: var(--muted); }
+code { font-family: var(--mono); font-size: .85em; background: var(--panel-2); padding: .1rem .3rem; border-radius: var(--radius-s); word-break: break-all; }
+.sso-buttons { display: grid; gap: .5rem; }
+.sso-buttons .btn { justify-content: center; text-align: center; }

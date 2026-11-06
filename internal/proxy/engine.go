@@ -58,6 +58,39 @@ func init() { recheckInterval.Store(int64(15 * time.Second)) }
 
 type userKey struct{}
 
+type tokenKey struct{}
+
+// TokenPrefix starts every RyProx access token.
+const TokenPrefix = "ryp_"
+
+// TokenHeader carries an access token for scripts and API clients. It is
+// removed before the request reaches the backend.
+const TokenHeader = "X-Ryprox-Token"
+
+// takeToken removes a RyProx access token from the request and returns it.
+// Tokens come in TokenHeader, or as "Authorization: Bearer ryp_…" (only
+// RyProx tokens are taken; other Authorization headers are left for the app).
+func takeToken(h http.Header) string {
+	if t := h.Get(TokenHeader); t != "" {
+		h.Del(TokenHeader)
+		return t
+	}
+	if a := h.Get("Authorization"); len(a) > 7 && strings.EqualFold(a[:7], "bearer ") {
+		if t := strings.TrimSpace(a[7:]); strings.HasPrefix(t, TokenPrefix) {
+			h.Del("Authorization")
+			return t
+		}
+	}
+	return ""
+}
+
+// RequestToken returns the access token sent with a request to a private
+// route, if any. For use by the Gate.
+func RequestToken(r *http.Request) string {
+	t, _ := r.Context().Value(tokenKey{}).(string)
+	return t
+}
+
 type gateBox struct{ g Gate }
 
 // SetGate installs the access gate. Until one is set, private routes refuse
@@ -441,6 +474,7 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		WritePage(w, http.StatusTooManyRequests, "Slow down", "Too many requests from your address. Please wait a minute and try again.")
 		return
 	}
+	tok := takeToken(r.Header)
 	stripUnsafeHeaders(r.Header)
 	if !cfg.Access.IsPublic() {
 		gb := e.gate.Load()
@@ -451,6 +485,9 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, PortalPrefix) {
 			gb.g.Portal(w, r, &lr.route)
 			return
+		}
+		if tok != "" {
+			r = r.WithContext(context.WithValue(r.Context(), tokenKey{}, tok))
 		}
 		user, stillAllowed, ok := gb.g.Authorize(w, r, &lr.route)
 		if !ok {

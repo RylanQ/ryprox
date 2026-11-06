@@ -157,13 +157,17 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleLoginVerify(w http.ResponseWriter, r *http.Request) {
-	s.loginVerify(w, r, dashboard, func(u *store.User) string {
-		if u.Role != store.RoleAdmin {
-			return "this account can't manage RyProx; open the sites you've been given instead"
-		}
-		return ""
-	})
+	s.loginVerify(w, r, dashboard, adminsOnly)
 }
+
+func adminsOnly(u *store.User) string {
+	if u.Role != store.RoleAdmin {
+		return "this account can't manage RyProx; open the sites you've been given instead"
+	}
+	return ""
+}
+
+func anyone(*store.User) string { return "" }
 
 // loginPassword is step one of signing in to a realm: the password.
 func (s *Server) loginPassword(w http.ResponseWriter, r *http.Request, rl realm) {
@@ -293,21 +297,10 @@ func (s *Server) loginVerify(w http.ResponseWriter, r *http.Request, rl realm, a
 	s.limiter.Reset("user:" + strings.ToLower(u.Username) + "|" + clientKey(r))
 	s.ipLimit.Reset("ip:" + clientKey(r))
 
-	where := "the dashboard"
-	if rl.host != "" {
-		where = rl.host
-	}
-	if reason := authorize(u); reason != "" {
-		s.audit(r, u.Username, "access.denied", where)
-		writeError(w, http.StatusForbidden, reason)
+	out, ok := s.finishLogin(w, r, u, rl, authorize, method)
+	if !ok {
 		return
 	}
-	if err := s.startSession(w, r, u.ID, rl); err != nil {
-		s.writeErr(w, err)
-		return
-	}
-	s.audit(r, u.Username, "login", "signed in to "+where+" with "+method)
-	out := map[string]any{"ok": true}
 	if method == "recovery code" {
 		latest, _ := s.Store.GetUser(r.Context(), u.ID)
 		if latest != nil {
@@ -315,6 +308,26 @@ func (s *Server) loginVerify(w http.ResponseWriter, r *http.Request, rl realm, a
 		}
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// finishLogin starts a session for a user who has fully proven who they
+// are, if authorize allows it. On failure it writes the response.
+func (s *Server) finishLogin(w http.ResponseWriter, r *http.Request, u *store.User, rl realm, authorize func(*store.User) string, method string) (map[string]any, bool) {
+	where := "the dashboard"
+	if rl.host != "" {
+		where = rl.host
+	}
+	if reason := authorize(u); reason != "" {
+		s.audit(r, u.Username, "access.denied", where)
+		writeError(w, http.StatusForbidden, reason)
+		return nil, false
+	}
+	if err := s.startSession(w, r, u.ID, rl); err != nil {
+		s.writeErr(w, err)
+		return nil, false
+	}
+	s.audit(r, u.Username, "login", "signed in to "+where+" with "+method)
+	return map[string]any{"ok": true}, true
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request, u *store.User, sess *store.Session) {

@@ -259,7 +259,24 @@ function loginPage() {
       showError(form, e);
     }
   });
-  authLayout(h("h1", {}, "Sign in"), h("p", { class: "lede" }, "Manage your routes and certificates."), form);
+  const pkBtn = window.RyPasskey?.supported() ? h("button", { class: "btn", type: "button" }, "Sign in with a passkey") : null;
+  pkBtn?.addEventListener("click", async () => {
+    clearErrors(form);
+    busy(pkBtn, true, "Waiting for your device…");
+    try {
+      const b = await api("POST", "/api/login/passkey/begin", {});
+      const cred = await window.RyPasskey.get(b.options);
+      await api("POST", `/api/login/passkey/finish?id=${encodeURIComponent(b.id)}`, cred);
+      const st = await api("GET", "/api/state");
+      state.user = st.user;
+      go("#/");
+    } catch (e) {
+      busy(pkBtn, false);
+      showError(form, e instanceof ApiError ? e : { message: window.RyPasskey.message(e) });
+    }
+  });
+  authLayout(h("h1", {}, "Sign in"), h("p", { class: "lede" }, "Manage your routes and certificates."), form,
+    pkBtn ? h("div", { class: "or" }, h("span", {}, "or")) : null, pkBtn);
   user.focus();
 }
 
@@ -958,14 +975,160 @@ async function settingsPage() {
       } }, "Sign out all other devices")) : null);
   };
 
+  const pkBox = passkeysBox("/api/account/passkeys");
+  const tokBox = tokensBox("/api/account/tokens", true);
+  const ssoBox = ssoEditor();
+
   shell("settings",
     h("div", { class: "page-head" }, h("div", {}, h("h1", {}, "Settings"))),
     h("section", { class: "section" }, h("header", {}, h("h2", {}, "HTTPS")), httpsForm),
+    h("section", { class: "section" }, h("header", {}, h("h2", {}, "Single sign-on"),
+      h("p", {}, "Let people sign in to private sites with Google, Microsoft, Authentik or another OpenID Connect provider. Only people whose email you've set on the People page can sign in this way.")), ssoBox),
     h("section", { class: "section" }, h("header", {}, h("h2", {}, "Password")), pwForm),
     h("section", { class: "section" }, h("header", {}, h("h2", {}, "Recovery codes"), h("p", {}, "Use one to sign in if you lose your authenticator app.")), rcForm),
+    h("section", { class: "section" }, h("header", {}, h("h2", {}, "Passkeys"),
+      h("p", {}, "Sign in with your fingerprint, face or device PIN instead of a password and code. A passkey only works on the address it was added on.")), pkBox),
+    h("section", { class: "section" }, h("header", {}, h("h2", {}, "Access tokens"),
+      h("p", {}, "For scripts and apps. A sites token opens your private sites without a browser (send it as Authorization: Bearer <token>). An admin token uses this dashboard's API.")), tokBox),
     h("section", { class: "section" }, h("header", {}, h("h2", {}, "Signed-in devices")), sessBox),
     h("p", { class: "muted" }, `RyProx ${state.version}`));
   loadSessions();
+}
+
+// ---------- passkeys & tokens (also used on the sign-in page) ----------
+function passkeysBox(base) {
+  const box = h("div", {});
+  const load = async () => {
+    let r;
+    try { r = await api("GET", base); } catch { return; }
+    const pw = h("input", { type: "password", autocomplete: "current-password", "data-field": "password" });
+    const name = h("input", { type: "text", "data-field": "name", placeholder: "My laptop", maxlength: 60 });
+    const add = h("button", { class: "btn", type: "submit" }, "Add a passkey");
+    const form = h("form", { novalidate: true, class: "mt" },
+      h("div", { class: "two" }, field("Name", name), field("Confirm your password", pw)),
+      h("div", { class: "actions" }, add));
+    form.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      clearErrors(form);
+      if (!window.RyPasskey?.supported()) return showError(form, { message: "This browser doesn't support passkeys." });
+      busy(add, true, "Waiting for your device…");
+      try {
+        const opts = await api("POST", base + "/begin", { password: pw.value });
+        const cred = await window.RyPasskey.create(opts);
+        await api("POST", `${base}/finish?name=${encodeURIComponent(name.value || "Passkey")}`, cred);
+        toast("Passkey added.");
+        load();
+      } catch (e) {
+        busy(add, false);
+        showError(form, e instanceof ApiError ? e : { message: window.RyPasskey.message(e) });
+      }
+    });
+    box.replaceChildren(
+      r.passkeys.length ? h("ul", { class: "plain-list" }, r.passkeys.map((k) => h("li", {},
+        h("span", {}, h("b", {}, k.name), h("span", { class: "muted" }, " · added ", ago(k.createdAt), k.lastUsedAt && !k.lastUsedAt.startsWith("0001") ? ", last used " + ago(k.lastUsedAt) : "")),
+        h("button", { class: "btn small", type: "button", onclick: async () => {
+          if (!(await confirmDialog("Remove this passkey?", `${k.name} won't be able to sign in any more.`, "Remove"))) return;
+          try { await api("DELETE", `${base}/${k.id}`); toast("Passkey removed."); load(); } catch (e) { toast(e.message, "error"); }
+        } }, "Remove")))) : h("p", { class: "muted" }, "No passkeys yet."),
+      form);
+  };
+  load();
+  return box;
+}
+
+function tokensBox(base, allowAdmin) {
+  const box = h("div", {});
+  const out = h("div", {});
+  const load = async () => {
+    let r;
+    try { r = await api("GET", base); } catch { return; }
+    const name = h("input", { type: "text", "data-field": "name", placeholder: "Backup script", maxlength: 60 });
+    const scope = h("select", { "data-field": "scope" }, h("option", { value: "sites" }, "Open my private sites"),
+      allowAdmin ? h("option", { value: "admin" }, "Manage RyProx (admin API)") : null);
+    const exp = h("select", { "data-field": "expiresDays" }, h("option", { value: "30" }, "30 days"), h("option", { value: "90" }, "90 days"),
+      h("option", { value: "365" }, "1 year"), h("option", { value: "0" }, "Never"));
+    const add = h("button", { class: "btn", type: "submit" }, "Create token");
+    const form = h("form", { novalidate: true, class: "mt" }, h("div", { class: "three" }, field("Name", name), field("Can", scope), field("Expires after", exp)),
+      h("div", { class: "actions" }, add));
+    form.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      clearErrors(form);
+      busy(add, true);
+      try {
+        const t = await api("POST", base, { name: name.value, scope: scope.value, expiresDays: Number(exp.value) });
+        out.replaceChildren(h("div", { class: "banner" }, h("p", {}, h("b", {}, "Copy this token now. "), "It won't be shown again."),
+          h("div", { class: "secret mono" }, t.token),
+          h("div", { class: "row" }, h("button", { class: "btn small", type: "button", onclick: () => copy(t.token) }, "Copy"))));
+        load();
+      } catch (e) { busy(add, false); showError(form, e); }
+    });
+    const scopeName = { sites: "Opens private sites", admin: "Admin API" };
+    box.replaceChildren(out,
+      r.tokens.length ? h("ul", { class: "plain-list" }, r.tokens.map((t) => h("li", {},
+        h("span", {}, h("b", {}, t.name), h("span", { class: "muted" }, ` · ${scopeName[t.scope] || t.scope}`,
+          t.expiresAt && !t.expiresAt.startsWith("0001") ? ` · expires ${new Date(t.expiresAt).toLocaleDateString()}` : " · never expires",
+          t.lastUsedAt && !t.lastUsedAt.startsWith("0001") ? ` · used ${ago(t.lastUsedAt)}` : " · never used")),
+        h("button", { class: "btn small", type: "button", onclick: async () => {
+          if (!(await confirmDialog("Delete this token?", `Anything using "${t.name}" will stop working.`, "Delete"))) return;
+          try { await api("DELETE", `${base}/${t.id}`); toast("Token deleted."); out.replaceChildren(); load(); } catch (e) { toast(e.message, "error"); }
+        } }, "Delete")))) : h("p", { class: "muted" }, "No tokens yet."),
+      form);
+  };
+  load();
+  return box;
+}
+
+function ssoEditor() {
+  const box = h("div", {});
+  const load = async () => {
+    let r;
+    try { r = await api("GET", "/api/sso"); } catch { return; }
+    const list = h("div", {});
+    const presets = {
+      google: { id: "google", name: "Google", issuer: "https://accounts.google.com" },
+      microsoft: { id: "microsoft", name: "Microsoft", issuer: "https://login.microsoftonline.com/<tenant-id>/v2.0" },
+      authentik: { id: "authentik", name: "Authentik", issuer: "https://authentik.example.com/application/o/ryprox" },
+    };
+    const addRow = (p) => {
+      const i = list.children.length;
+      const f = (k, label, input, hint) => { input.dataset.field = `providers.${i}.${k}`; return field(label, input, hint); };
+      const id = h("input", { type: "text", value: p.id || "", class: "mono", spellcheck: "false" });
+      const name = h("input", { type: "text", value: p.name || "" });
+      const issuer = h("input", { type: "text", value: p.issuer || "", class: "mono", spellcheck: "false", placeholder: "https://accounts.google.com" });
+      const cid = h("input", { type: "text", value: p.clientId || "", class: "mono", spellcheck: "false" });
+      const secret = h("input", { type: "password", autocomplete: "off", placeholder: p.hasSecret ? "Saved (leave empty to keep)" : "" });
+      const trust = toggle("Trust email addresses from this provider", "Only for a provider you control, like your company's Microsoft tenant. Otherwise RyProx needs the provider to confirm the address is verified.", !!p.trustEmail);
+      const rm = h("button", { class: "btn small", type: "button" }, "Remove");
+      const row = h("div", { class: "sso-row" },
+        h("div", { class: "two" }, f("name", "Button label", name), f("id", "ID", id, "Short, lowercase, used in links")),
+        f("issuer", "Issuer address", issuer), h("div", { class: "two" }, f("clientId", "Client ID", cid), f("clientSecret", "Client secret", secret)),
+        trust, h("div", { class: "actions" }, rm));
+      row.read = () => ({ id: id.value, name: name.value, issuer: issuer.value, clientId: cid.value, clientSecret: secret.value, trustEmail: trust.querySelector("input").checked });
+      rm.addEventListener("click", () => row.remove());
+      list.append(row);
+    };
+    r.providers.forEach(addRow);
+    const save = h("button", { class: "btn primary", type: "submit" }, "Save sign-on providers");
+    const form = h("form", { novalidate: true }, list,
+      h("div", { class: "row" }, Object.entries(presets).map(([k, p]) => h("button", { class: "btn small", type: "button", onclick: () => addRow(p) }, "Add " + p.name)),
+        h("button", { class: "btn small", type: "button", onclick: () => addRow({}) }, "Add other")),
+      r.callbackUrl ? h("p", { class: "muted mt" }, "In the provider, set the redirect URI to ", h("code", {}, r.callbackUrl), ".")
+        : h("p", { class: "warn-inline" }, "Set a sign-in domain above first; providers send people back there."),
+      h("div", { class: "actions" }, save));
+    form.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      clearErrors(form);
+      busy(save, true, "Saving…");
+      try {
+        await api("PUT", "/api/sso", { providers: [...list.children].map((row) => row.read()) });
+        toast("Sign-on providers saved.");
+        load();
+      } catch (e) { busy(save, false); showError(form, e); }
+    });
+    box.replaceChildren(form);
+  };
+  load();
+  return box;
 }
 
 function describeUA(ua) {
@@ -1070,7 +1233,9 @@ function personRow(p, me, reload) {
   };
   role.addEventListener("change", () => save({ role: role.value }, `${p.username} is now ${role.value === "admin" ? "an admin" : "a member"}.`));
   return h("tr", { class: p.disabled ? "row-off" : "" },
-    h("td", {}, h("b", {}, p.username), self ? h("div", { class: "muted" }, "You") : null, p.disabled ? h("div", { class: "err" }, "Disabled") : null),
+    h("td", {}, h("b", {}, p.username), self ? h("div", { class: "muted" }, "You") : null, p.disabled ? h("div", { class: "err" }, "Disabled") : null,
+      h("div", {}, h("button", { class: "linkish small", type: "button", title: "Used to match their single sign-on account", onclick: () => editEmail(p, reload) },
+        p.email || "Add email for sign-on"))),
     h("td", {}, role),
     h("td", {}, p.sites.length ? h("div", { class: "mono small-list" }, p.sites.map((x) => h("div", {}, x))) : h("span", { class: "muted" }, "None")),
     h("td", {}, ago(p.lastLoginAt)),
@@ -1084,6 +1249,32 @@ function personRow(p, me, reload) {
         catch (e) { toast(e.message, "error"); }
         reload();
       } }, "Remove"))));
+}
+
+async function editEmail(p, reload) {
+  const input = h("input", { type: "email", value: p.email || "", "data-field": "email", placeholder: "name@example.com", autocomplete: "off" });
+  const ok = h("button", { class: "btn primary", type: "submit" }, "Save");
+  const form = h("form", { novalidate: true, method: "dialog" },
+    h("h2", {}, `Sign-on email for ${p.username}`),
+    h("p", { class: "muted" }, "When they sign in with Google, Microsoft or another provider, RyProx matches this address. Leave empty to turn single sign-on off for them."),
+    field("Email", input),
+    h("div", { class: "actions" }, ok, h("button", { class: "btn", type: "button", onclick: () => dlg.close() }, "Cancel")));
+  const dlg = h("dialog", { class: "dialog" }, form);
+  form.addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    clearErrors(form);
+    busy(ok, true);
+    try {
+      await api("PUT", `/api/people/${p.id}/email`, { email: input.value.trim() });
+      dlg.close();
+      toast("Email saved.");
+      reload();
+    } catch (e) { busy(ok, false); showError(form, e); }
+  });
+  dlg.addEventListener("close", () => dlg.remove());
+  document.body.append(dlg);
+  dlg.showModal();
+  input.focus();
 }
 
 // ---------- activity ----------
@@ -1101,7 +1292,9 @@ const actionText = {
 async function activityPage() {
   const body = h("div", { "aria-busy": "true" });
   shell("activity",
-    h("div", { class: "page-head" }, h("div", {}, h("h1", {}, "Activity"), h("p", { class: "lede" }, "Every change and sign-in, newest first."))),
+    h("div", { class: "page-head" }, h("div", {}, h("h1", {}, "Activity"), h("p", { class: "lede" }, "Every change and sign-in, newest first.")),
+      h("div", { class: "row" }, h("a", { class: "btn", href: "/api/activity/export?format=csv", download: "" }, "Export CSV"),
+        h("a", { class: "btn", href: "/api/activity/export?format=json", download: "" }, "Export JSON"))),
     body);
   let list;
   try { list = await api("GET", "/api/activity"); } catch { return; }

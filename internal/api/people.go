@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/mail"
 	"strconv"
 	"strings"
 	"time"
@@ -19,6 +20,7 @@ import (
 type personView struct {
 	ID          int64     `json:"id"`
 	Username    string    `json:"username"`
+	Email       string    `json:"email"`
 	Role        string    `json:"role"`
 	Disabled    bool      `json:"disabled"`
 	CreatedAt   time.Time `json:"createdAt"`
@@ -44,7 +46,7 @@ func (s *Server) handleListPeople(w http.ResponseWriter, r *http.Request, me *st
 	}
 	out := make([]personView, 0, len(users))
 	for _, u := range users {
-		p := personView{ID: u.ID, Username: u.Username, Role: u.Role, Disabled: u.Disabled,
+		p := personView{ID: u.ID, Username: u.Username, Email: u.Email, Role: u.Role, Disabled: u.Disabled,
 			CreatedAt: u.CreatedAt, LastLoginAt: u.LastLoginAt, Sites: []string{}}
 		for _, rt := range routes {
 			if !rt.Config.Access.IsPublic() && rt.Config.Access.Allows(u.ID) {
@@ -234,4 +236,43 @@ func (s *Server) checkAccessUsers(r *http.Request, rt *store.Route) error {
 		}
 	}
 	return nil
+}
+
+// handleSetEmail sets the email used to match someone's single sign-on
+// account. Changing it unlinks any sign-on account matched by the old one.
+func (s *Server) handleSetEmail(w http.ResponseWriter, r *http.Request, me *store.User, _ *store.Session) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad id")
+		return
+	}
+	var in struct {
+		Email string `json:"email"`
+	}
+	if !readJSON(w, r, &in) {
+		return
+	}
+	in.Email = strings.TrimSpace(in.Email)
+	if in.Email != "" {
+		a, err := mail.ParseAddress(in.Email)
+		if err != nil || a.Address != in.Email || len(in.Email) > 254 {
+			writeJSON(w, http.StatusBadRequest, apiError{Error: "enter a valid email address, or leave it empty", Field: "email"})
+			return
+		}
+	}
+	target, err := s.Store.GetUser(r.Context(), id)
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	if err := s.Store.SetEmail(r.Context(), id, in.Email); err != nil {
+		if errors.Is(err, store.ErrConflict) {
+			writeJSON(w, http.StatusConflict, apiError{Error: "someone else already uses this email address", Field: "email"})
+			return
+		}
+		s.writeErr(w, err)
+		return
+	}
+	s.audit(r, me.Username, "user.email", target.Username+": "+in.Email)
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }

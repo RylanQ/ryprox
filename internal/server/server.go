@@ -18,10 +18,13 @@ import (
 
 	"github.com/rylanq/ryprox/internal/api"
 	"github.com/rylanq/ryprox/internal/certs"
+	"github.com/rylanq/ryprox/internal/console"
+	"github.com/rylanq/ryprox/internal/crowdsec"
 	"github.com/rylanq/ryprox/internal/health"
 	"github.com/rylanq/ryprox/internal/proxy"
 	"github.com/rylanq/ryprox/internal/secrets"
 	"github.com/rylanq/ryprox/internal/store"
+	"github.com/rylanq/ryprox/internal/tunnel"
 )
 
 // Options configure a RyProx instance. Everything else is set in the UI.
@@ -33,6 +36,7 @@ type Options struct {
 	// Advanced: get certificates from another ACME server instead of Let's Encrypt.
 	ACMEDirectory string
 	ACMECAFile    string
+	Guacd         string // default guacd address (the dashboard setting wins)
 	Log           *slog.Logger
 	UI            fs.FS
 	// Ready, if set, is called once all listeners are open.
@@ -66,7 +70,9 @@ func Run(ctx context.Context, o Options) error {
 		return fmt.Errorf("saved routes are invalid: %w", err)
 	}
 
-	adm := &api.Server{Store: st, Engine: engine, Box: box, Log: log, UI: o.UI, HTTPSPort: portOf(o.HTTPSAddr)}
+	bouncer := crowdsec.New(log)
+	defer bouncer.Close()
+	adm := &api.Server{Store: st, Engine: engine, Box: box, Log: log, UI: o.UI, HTTPSPort: portOf(o.HTTPSAddr), CrowdSec: bouncer}
 	cm := certs.New(filepath.Join(o.DataDir, "certs"), func(host string) bool {
 		if set := adm.Settings(); host != "" && (host == set.AdminHostname || host == set.AuthHostname) {
 			return true
@@ -75,6 +81,13 @@ func Run(ctx context.Context, o Options) error {
 	}, log)
 	adm.Certs = cm
 	engine.SetGate(adm) // private routes check every request against the access lists
+	adm.Console = &console.Service{Store: st, Box: box, Log: log, UI: o.UI, DefaultGuacd: o.Guacd,
+		Audit: func(r *http.Request, actor, action, detail string) { adm.Audit(r, actor, action, detail) }}
+	engine.SetConsole(adm.Console)
+	hub := tunnel.NewHub(log)
+	adm.Tunnels = hub
+	engine.SetTunnels(hub)
+	adm.Console.Dial = engine.DialTarget
 	if o.ACMEDirectory != "" {
 		if err := cm.UseCustomServer(o.ACMEDirectory, o.ACMECAFile); err != nil {
 			return err
@@ -91,8 +104,13 @@ func Run(ctx context.Context, o Options) error {
 	signInHandler := adm.SignInHandler()
 	httpsPort := portOf(o.HTTPSAddr)
 
+	// Visitors banned by CrowdSec are turned away before anything else.
+	deny := func(w http.ResponseWriter) {
+		proxy.WritePage(w, http.StatusForbidden, "Access blocked", "Your address has been blocked because of suspicious activity.")
+	}
+
 	// Public HTTP: Let's Encrypt challenges, HTTPS redirects, and plain-HTTP routes.
-	httpHandler := cm.HTTPHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	httpHandler := cm.HTTPHandler(bouncer.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		host := proxy.NormalizeHost(r.Host)
 		set := adm.Settings()
 		ownDomain := host != "" && (host == set.AdminHostname || host == set.AuthHostname)
@@ -101,10 +119,10 @@ func Run(ctx context.Context, o Options) error {
 			return
 		}
 		engine.ServeHTTP(w, r)
-	}))
+	}), deny))
 
 	// Public HTTPS: RyProx's own domains (dashboard, sign-in), else routes.
-	httpsHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	httpsHandler := bouncer.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		host := proxy.NormalizeHost(r.Host)
 		set := adm.Settings()
 		switch {
@@ -115,7 +133,7 @@ func Run(ctx context.Context, o Options) error {
 		default:
 			engine.ServeHTTP(w, r)
 		}
-	})
+	}), deny)
 
 	mux := http.NewServeMux()
 	mux.Handle("/healthz", health.Handler())

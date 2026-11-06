@@ -42,6 +42,7 @@ const (
 // Files the sign-in portal may serve, on the sign-in domain only.
 var portalFiles = map[string]string{
 	"portal.js":   "text/javascript; charset=utf-8",
+	"webauthn.js": "text/javascript; charset=utf-8",
 	"app.css":     "text/css; charset=utf-8",
 	"favicon.svg": "image/svg+xml",
 }
@@ -80,6 +81,13 @@ func (s *Server) signInURL(page string, q url.Values) string {
 // Authorize checks every request to a private site: a valid session for
 // this exact site, an enabled account, and a place on the site's access list.
 func (s *Server) Authorize(w http.ResponseWriter, r *http.Request, route *store.Route) (string, func() bool, bool) {
+	if tok := proxy.RequestToken(r); tok != "" {
+		user, still, ok := s.authorizeToken(r, route, tok)
+		if !ok {
+			proxy.WritePage(w, http.StatusUnauthorized, "Token not accepted", "This access token isn't valid for this site.")
+		}
+		return user, still, ok
+	}
 	rl := realm{route.Hostname}
 	u, sess := s.sessionFor(r, rl)
 	if u == nil || !route.Config.Access.Allows(u.ID) {
@@ -298,7 +306,7 @@ func (s *Server) buildPortal() http.Handler {
 			writeError(w, http.StatusNotFound, "sign in on the dashboard instead")
 			return
 		}
-		s.loginVerify(w, r, rl, func(*store.User) string { return "" })
+		s.loginVerify(w, r, rl, anyone)
 	})
 	mux.HandleFunc("POST "+p+"api/continue", s.handleContinue)
 	mux.HandleFunc("POST "+p+"api/logout", func(w http.ResponseWriter, r *http.Request) {
@@ -314,6 +322,53 @@ func (s *Server) buildPortal() http.Handler {
 		s.clearSessionCookie(w, r, rl)
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 	})
+	portalUser := func(h func(http.ResponseWriter, *http.Request, *store.User)) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			rl, ok := s.portalRealm(r)
+			if !ok {
+				writeError(w, http.StatusNotFound, "not available here")
+				return
+			}
+			u, _ := s.sessionFor(r, rl)
+			if u == nil {
+				writeError(w, http.StatusUnauthorized, "please sign in")
+				return
+			}
+			h(w, r, u)
+		}
+	}
+	inRealm := func(h func(http.ResponseWriter, *http.Request, *store.User, realm)) http.HandlerFunc {
+		return portalUser(func(w http.ResponseWriter, r *http.Request, u *store.User) {
+			rl, _ := s.portalRealm(r)
+			h(w, r, u, rl)
+		})
+	}
+	mux.HandleFunc("GET "+p+"api/passkeys", portalUser(s.listPasskeys))
+	mux.HandleFunc("POST "+p+"api/passkeys/begin", inRealm(s.passkeyRegisterBegin))
+	mux.HandleFunc("POST "+p+"api/passkeys/finish", inRealm(s.passkeyRegisterFinish))
+	mux.HandleFunc("DELETE "+p+"api/passkeys/{id}", portalUser(s.deletePasskey))
+	mux.HandleFunc("POST "+p+"api/login/passkey/begin", func(w http.ResponseWriter, r *http.Request) {
+		rl, ok := s.portalRealm(r)
+		if !ok {
+			writeError(w, http.StatusNotFound, "not available here")
+			return
+		}
+		s.passkeyLoginBegin(w, r, rl)
+	})
+	mux.HandleFunc("POST "+p+"api/login/passkey/finish", func(w http.ResponseWriter, r *http.Request) {
+		rl, ok := s.portalRealm(r)
+		if !ok {
+			writeError(w, http.StatusNotFound, "not available here")
+			return
+		}
+		s.passkeyLoginFinish(w, r, rl, anyone)
+	})
+	mux.HandleFunc("GET "+p+"tunnel", s.handleTunnel)
+	mux.HandleFunc("GET "+p+"sso/callback", s.handleSSOCallback)
+	mux.HandleFunc("GET "+p+"sso/{id}/start", s.handleSSOStart)
+	mux.HandleFunc("GET "+p+"api/tokens", portalUser(s.listTokens))
+	mux.HandleFunc("POST "+p+"api/tokens", portalUser(func(w http.ResponseWriter, r *http.Request, u *store.User) { s.createToken(w, r, u, false) }))
+	mux.HandleFunc("DELETE "+p+"api/tokens/{id}", portalUser(s.deleteToken))
 	mux.HandleFunc("POST "+p+"api/invite/begin", s.handleInviteBegin)
 	mux.HandleFunc("POST "+p+"api/invite/finish", s.handleInviteFinish)
 	mux.HandleFunc(p, func(w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) })
@@ -340,6 +395,13 @@ func (s *Server) handlePortalState(w http.ResponseWriter, r *http.Request) {
 		"version":      version.Version,
 	}
 	if onSignIn {
+		if ps, err := s.ssoProviders(r.Context()); err == nil {
+			opts := []map[string]string{}
+			for _, p := range ps {
+				opts = append(opts, map[string]string{"id": p.ID, "name": p.Name})
+			}
+			out["sso"] = opts
+		}
 		if u, _ := s.sessionFor(r, rl); u != nil {
 			out["user"] = u.Username
 			out["sites"] = s.allowedSites(u.ID)

@@ -20,9 +20,12 @@ import (
 	"github.com/rylanq/ryprox/internal/auth"
 	"github.com/rylanq/ryprox/internal/certs"
 	"github.com/rylanq/ryprox/internal/config"
+	"github.com/rylanq/ryprox/internal/console"
+	"github.com/rylanq/ryprox/internal/crowdsec"
 	"github.com/rylanq/ryprox/internal/proxy"
 	"github.com/rylanq/ryprox/internal/secrets"
 	"github.com/rylanq/ryprox/internal/store"
+	"github.com/rylanq/ryprox/internal/tunnel"
 	"github.com/rylanq/ryprox/internal/version"
 )
 
@@ -44,6 +47,18 @@ type Server struct {
 	Log    *slog.Logger
 	UI     fs.FS // the web/static directory
 
+	// Tunnels reaches services on remote sites through connected agents.
+	Tunnels *tunnel.Hub
+
+	// Console opens terminals and remote desktops (optional).
+	Console *console.Service
+
+	// CrowdSec blocks visitors banned by a CrowdSec Local API (optional).
+	CrowdSec *crowdsec.Bouncer
+
+	// HTTPClient talks to single sign-on providers (nil: a default client).
+	HTTPClient *http.Client
+
 	// HTTPSPort is the public HTTPS port, used to build links to sites.
 	HTTPSPort string
 
@@ -52,10 +67,13 @@ type Server struct {
 	limiter *auth.Limiter // per account (and per account + address)
 	ipLimit *auth.Limiter // per client address
 
-	mu        sync.Mutex
-	setupHash []byte // hash of the one-time setup code; nil once set up
-	pending   map[string]pendingLogin
-	handoffs  map[string]handoff // one-time codes that sign a visitor in to a site
+	mu         sync.Mutex
+	setupHash  []byte // hash of the one-time setup code; nil once set up
+	pending    map[string]pendingLogin
+	handoffs   map[string]handoff  // one-time codes that sign a visitor in to a site
+	ceremonies map[string]ceremony // passkey challenges in progress
+	ssoStates  map[string]ssoState // single sign-on logins in progress
+	ssoCache   sync.Map            // discovered providers
 
 	portalOnce sync.Once
 	portal     http.Handler
@@ -80,6 +98,7 @@ func New(ctx context.Context, s *Server) (setupCode string, err error) {
 		return "", err
 	}
 	s.settings.Store(&st)
+	s.startCrowdSec(ctx)
 	n, err := s.Store.CountAdmins(ctx)
 	if err != nil {
 		return "", err
@@ -112,6 +131,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/setup/finish", s.handleSetupFinish)
 	mux.HandleFunc("POST /api/login", s.handleLogin)
 	mux.HandleFunc("POST /api/login/verify", s.handleLoginVerify)
+	mux.HandleFunc("POST /api/login/passkey/begin", func(w http.ResponseWriter, r *http.Request) { s.passkeyLoginBegin(w, r, dashboard) })
+	mux.HandleFunc("POST /api/login/passkey/finish", func(w http.ResponseWriter, r *http.Request) {
+		s.passkeyLoginFinish(w, r, dashboard, adminsOnly)
+	})
 
 	// Endpoints that need a logged-in admin.
 	priv := func(pattern string, h func(http.ResponseWriter, *http.Request, *store.User, *store.Session)) {
@@ -138,6 +161,40 @@ func (s *Server) Handler() http.Handler {
 	priv("POST /api/invites", s.handleCreateInvite)
 	priv("DELETE /api/invites/{id}", s.handleDeleteInvite)
 	priv("PUT /api/people/{id}", s.handleUpdatePerson)
+	priv("PUT /api/people/{id}/email", s.handleSetEmail)
+	priv("GET /api/account/passkeys", func(w http.ResponseWriter, r *http.Request, u *store.User, _ *store.Session) { s.listPasskeys(w, r, u) })
+	priv("POST /api/account/passkeys/begin", func(w http.ResponseWriter, r *http.Request, u *store.User, _ *store.Session) {
+		s.passkeyRegisterBegin(w, r, u, dashboard)
+	})
+	priv("POST /api/account/passkeys/finish", func(w http.ResponseWriter, r *http.Request, u *store.User, _ *store.Session) {
+		s.passkeyRegisterFinish(w, r, u, dashboard)
+	})
+	priv("DELETE /api/account/passkeys/{id}", func(w http.ResponseWriter, r *http.Request, u *store.User, _ *store.Session) {
+		s.deletePasskey(w, r, u)
+	})
+	priv("POST /api/import/npm", s.handleImportNPM)
+	priv("GET /api/sites", s.handleListSites)
+	priv("POST /api/sites", s.handleCreateSite)
+	priv("POST /api/sites/{id}/token", s.handleSiteToken)
+	priv("DELETE /api/sites/{id}", s.handleDeleteSite)
+	priv("GET /api/console", s.handleGetConsole)
+	priv("PUT /api/console", s.handlePutConsole)
+	priv("GET /api/routes/{id}/host-key", s.handleRouteHostKey)
+	priv("DELETE /api/routes/{id}/host-key", s.handleForgetHostKey)
+	priv("GET /api/crowdsec", s.handleGetCrowdSec)
+	priv("PUT /api/crowdsec", s.handlePutCrowdSec)
+	priv("GET /api/sso", s.handleGetSSO)
+	priv("PUT /api/sso", s.handlePutSSO)
+	priv("GET /api/activity/export", s.handleActivityExport)
+	priv("GET /api/account/tokens", func(w http.ResponseWriter, r *http.Request, u *store.User, _ *store.Session) { s.listTokens(w, r, u) })
+	priv("POST /api/account/tokens", func(w http.ResponseWriter, r *http.Request, u *store.User, sess *store.Session) {
+		if sess.ID == 0 {
+			writeError(w, http.StatusForbidden, "tokens can't create other tokens")
+			return
+		}
+		s.createToken(w, r, u, true)
+	})
+	priv("DELETE /api/account/tokens/{id}", func(w http.ResponseWriter, r *http.Request, u *store.User, _ *store.Session) { s.deleteToken(w, r, u) })
 	priv("DELETE /api/people/{id}", s.handleDeletePerson)
 
 	// The sign-in portal also works here, so invites can be accepted on the
@@ -190,6 +247,13 @@ func (s *Server) securityHeaders(next http.Handler) http.Handler {
 func (s *Server) csrfProtect(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet || r.Method == http.MethodHead || r.Method == http.MethodOptions {
+			next.ServeHTTP(w, r)
+			return
+		}
+		// Scripts using an access token aren't browsers: a cross-site page can't
+		// send an Authorization header here without a CORS preflight, which is
+		// never granted, so the CSRF checks below don't apply to them.
+		if bearerToken(r) != "" && r.Header.Get("Cookie") == "" {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -302,6 +366,22 @@ func (s *Server) currentSession(r *http.Request) (*store.User, *store.Session) {
 
 func (s *Server) requireSession(h func(http.ResponseWriter, *http.Request, *store.User, *store.Session)) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if raw := bearerToken(r); raw != "" {
+			// API clients: an admin token, never mixed with a cookie session.
+			// Tokens can't change account security (password, passkeys,
+			// sessions, other tokens): that needs a person signed in.
+			if strings.HasPrefix(r.URL.Path, "/api/account/") || r.URL.Path == "/api/logout" {
+				writeError(w, http.StatusForbidden, "access tokens can't change account settings")
+				return
+			}
+			u, t := s.tokenUser(r.Context(), r, raw, store.ScopeAdmin)
+			if u == nil {
+				writeError(w, http.StatusUnauthorized, "access token not valid")
+				return
+			}
+			h(w, r, u, &store.Session{UserID: u.ID, IP: clientIP(r), UserAgent: "token: " + t.Name})
+			return
+		}
 		u, sess := s.currentSession(r)
 		if u == nil {
 			writeError(w, http.StatusUnauthorized, "please log in")
@@ -485,6 +565,11 @@ func (s *Server) writeErr(w http.ResponseWriter, err error) {
 		s.Log.Error("internal error", "err", err)
 		writeError(w, http.StatusInternalServerError, "something went wrong; check the RyProx logs")
 	}
+}
+
+// Audit records an action in the activity log.
+func (s *Server) Audit(r *http.Request, actor, action, detail string) {
+	s.audit(r, actor, action, detail)
 }
 
 func (s *Server) audit(r *http.Request, actor, action, detail string) {

@@ -3,14 +3,17 @@
 package api
 
 import (
+	"encoding/csv"
 	"fmt"
 	"net/http"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/rylanq/ryprox/internal/certs"
 	"github.com/rylanq/ryprox/internal/config"
+	"github.com/rylanq/ryprox/internal/console"
 	"github.com/rylanq/ryprox/internal/proxy"
 	"github.com/rylanq/ryprox/internal/store"
 )
@@ -31,7 +34,7 @@ func (s *Server) handleListRoutes(w http.ResponseWriter, r *http.Request, _ *sto
 	health := s.Engine.Health()
 	out := make([]routeView, 0, len(routes))
 	for _, rt := range routes {
-		out = append(out, routeView{Route: rt, Health: health[rt.ID], Cert: s.Certs.Status(rt.Hostname)})
+		out = append(out, routeView{Route: scrub(rt), Health: health[rt.ID], Cert: s.Certs.Status(rt.Hostname)})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"routes": out, "httpsEnabled": s.Certs.Enabled()})
 }
@@ -57,6 +60,39 @@ func (s *Server) apply(all []store.Route, newHost string) {
 	}
 }
 
+// scrub removes secrets before a route is sent to the browser.
+func scrub(rt store.Route) store.Route {
+	rt.Config.Console.HasPassword = rt.Config.Console.Password != ""
+	rt.Config.Console.Password = ""
+	return rt
+}
+
+// sealConsolePassword encrypts a newly entered console password, or keeps
+// the saved one when the field was left empty.
+func (s *Server) sealConsolePassword(rt, old *store.Route) error {
+	k := &rt.Config.Console
+	if !rt.Config.IsConsole() || k.Auth != store.ConsoleAuthStored {
+		k.Password = ""
+		return nil
+	}
+	switch {
+	case k.Password != "":
+		if len(k.Password) > 500 {
+			return &config.FieldError{Field: "console.password", Message: "password is too long"}
+		}
+		sealed, err := s.Box.Seal(k.Password, console.PasswordPurpose)
+		if err != nil {
+			return err
+		}
+		k.Password = sealed
+	case old != nil && old.Config.Console.Password != "" && old.Config.Console.Address == k.Address:
+		k.Password = old.Config.Console.Password
+	default:
+		return &config.FieldError{Field: "console.password", Message: "enter the password to save"}
+	}
+	return nil
+}
+
 func (s *Server) readRoute(w http.ResponseWriter, r *http.Request) (*store.Route, bool) {
 	var in struct {
 		Hostname string            `json:"hostname"`
@@ -75,12 +111,20 @@ func (s *Server) readRoute(w http.ResponseWriter, r *http.Request) (*store.Route
 		s.writeErr(w, err)
 		return nil, false
 	}
+	if err := s.checkSites(r, rt); err != nil {
+		s.writeErr(w, err)
+		return nil, false
+	}
 	return rt, true
 }
 
 func (s *Server) handleCreateRoute(w http.ResponseWriter, r *http.Request, u *store.User, _ *store.Session) {
 	rt, ok := s.readRoute(w, r)
 	if !ok {
+		return
+	}
+	if err := s.sealConsolePassword(rt, nil); err != nil {
+		s.writeErr(w, err)
 		return
 	}
 	all, err := s.Store.CreateRoute(r.Context(), rt, s.check)
@@ -90,7 +134,7 @@ func (s *Server) handleCreateRoute(w http.ResponseWriter, r *http.Request, u *st
 	}
 	s.apply(all, rt.Hostname)
 	s.audit(r, u.Username, "route.create", fmt.Sprintf("%s → %s", rt.Hostname, targetList(rt)))
-	writeJSON(w, http.StatusCreated, rt)
+	writeJSON(w, http.StatusCreated, scrub(*rt))
 }
 
 func (s *Server) handleUpdateRoute(w http.ResponseWriter, r *http.Request, u *store.User, _ *store.Session) {
@@ -104,6 +148,15 @@ func (s *Server) handleUpdateRoute(w http.ResponseWriter, r *http.Request, u *st
 		return
 	}
 	rt.ID = id
+	old, err := s.Store.GetRoute(r.Context(), id)
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	if err := s.sealConsolePassword(rt, old); err != nil {
+		s.writeErr(w, err)
+		return
+	}
 	all, err := s.Store.UpdateRoute(r.Context(), rt, s.check)
 	if err != nil {
 		s.writeErr(w, err)
@@ -111,7 +164,7 @@ func (s *Server) handleUpdateRoute(w http.ResponseWriter, r *http.Request, u *st
 	}
 	s.apply(all, rt.Hostname)
 	s.audit(r, u.Username, "route.update", fmt.Sprintf("%s → %s", rt.Hostname, targetList(rt)))
-	writeJSON(w, http.StatusOK, rt)
+	writeJSON(w, http.StatusOK, scrub(*rt))
 }
 
 func (s *Server) handleDeleteRoute(w http.ResponseWriter, r *http.Request, u *store.User, _ *store.Session) {
@@ -172,8 +225,14 @@ func (s *Server) handleSetEnabled(w http.ResponseWriter, r *http.Request, u *sto
 }
 
 func targetList(r *store.Route) string {
+	if r.Config.IsConsole() {
+		return r.Config.Kind + " " + r.Config.Console.Address
+	}
+	if r.Config.IsRedirect() {
+		return "redirect to " + r.Config.Redirect.To
+	}
 	var t []string
-	for _, x := range r.Config.Targets {
+	for _, x := range r.Config.AllTargets() {
 		t = append(t, x.URL)
 	}
 	return strings.Join(t, ", ")
@@ -184,6 +243,7 @@ func (s *Server) handleTestTarget(w http.ResponseWriter, r *http.Request, _ *sto
 		URL           string `json:"url"`
 		TLSSkipVerify bool   `json:"tlsSkipVerify"`
 		Path          string `json:"path"`
+		Site          int64  `json:"site"`
 	}
 	if !readJSON(w, r, &in) {
 		return
@@ -197,7 +257,7 @@ func (s *Server) handleTestTarget(w http.ResponseWriter, r *http.Request, _ *sto
 	if in.Path != "" && strings.HasPrefix(in.Path, "/") && !strings.HasPrefix(in.Path, "//") {
 		path = in.Path
 	}
-	writeJSON(w, http.StatusOK, proxy.TestTarget(r.Context(), u+path, in.TLSSkipVerify))
+	writeJSON(w, http.StatusOK, s.Engine.TestTarget(r.Context(), u+path, in.TLSSkipVerify, in.Site))
 }
 
 func (s *Server) handleCertificates(w http.ResponseWriter, r *http.Request, _ *store.User, _ *store.Session) {
@@ -297,4 +357,36 @@ func (s *Server) handleActivity(w http.ResponseWriter, r *http.Request, _ *store
 		return
 	}
 	writeJSON(w, http.StatusOK, list)
+}
+
+// handleActivityExport downloads the audit log as CSV or JSON.
+func (s *Server) handleActivityExport(w http.ResponseWriter, r *http.Request, u *store.User, _ *store.Session) {
+	list, err := s.Store.ListAudit(r.Context(), 100000)
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	stamp := time.Now().UTC().Format("2006-01-02")
+	s.audit(r, u.Username, "activity.export", r.URL.Query().Get("format"))
+	if r.URL.Query().Get("format") == "json" {
+		w.Header().Set("Content-Disposition", `attachment; filename="ryprox-activity-`+stamp+`.json"`)
+		writeJSON(w, http.StatusOK, list)
+		return
+	}
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="ryprox-activity-`+stamp+`.csv"`)
+	cw := csv.NewWriter(w)
+	_ = cw.Write([]string{"time", "actor", "action", "detail", "ip"})
+	for _, e := range list {
+		_ = cw.Write([]string{e.At.UTC().Format(time.RFC3339), csvSafe(e.Actor), csvSafe(e.Action), csvSafe(e.Detail), csvSafe(e.IP)})
+	}
+	cw.Flush()
+}
+
+// csvSafe stops spreadsheet apps treating a cell as a formula.
+func csvSafe(v string) string {
+	if v != "" && strings.ContainsRune("=+-@\t\r", rune(v[0])) {
+		return "'" + v
+	}
+	return v
 }

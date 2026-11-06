@@ -5,6 +5,7 @@ go 1.26.0
 toolchain go1.27.3
 
 require (
+	github.com/coder/websocket v1.8.15
 	github.com/coreos/go-oidc/v3 v3.21.0
 	github.com/go-jose/go-jose/v4 v4.1.4
 	github.com/go-webauthn/webauthn v0.18.2
@@ -21,6 +22,7 @@ require (
 	github.com/golang-jwt/jwt/v5 v5.3.1 // indirect
 	github.com/google/go-tpm v0.9.8 // indirect
 	github.com/google/uuid v1.6.0 // indirect
+	github.com/hashicorp/yamux v0.1.2 // indirect
 	github.com/ncruces/go-sqlite3-wasm/v6 v6.4.35401 // indirect
 	github.com/ncruces/julianday v1.0.0 // indirect
 	github.com/philhofer/fwd v1.2.0 // indirect

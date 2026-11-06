@@ -28,10 +28,11 @@ import (
 
 // Engine routes requests by hostname to backends.
 type Engine struct {
-	snap   atomic.Pointer[snapshot]
-	health *HealthChecker
-	log    *slog.Logger
-	gate   atomic.Pointer[gateBox]
+	snap    atomic.Pointer[snapshot]
+	health  *HealthChecker
+	log     *slog.Logger
+	gate    atomic.Pointer[gateBox]
+	console atomic.Pointer[consoleBox]
 }
 
 // PortalPrefix is the path RyProx reserves on private sites for its own
@@ -92,6 +93,17 @@ func RequestToken(r *http.Request) string {
 }
 
 type gateBox struct{ g Gate }
+
+// Console serves terminal and remote desktop routes, after the gate has
+// let the visitor in.
+type Console interface {
+	ServeConsole(w http.ResponseWriter, r *http.Request, route *store.Route, username string)
+}
+
+type consoleBox struct{ c Console }
+
+// SetConsole installs the console service.
+func (e *Engine) SetConsole(c Console) { e.console.Store(&consoleBox{c}) }
 
 // SetGate installs the access gate. Until one is set, private routes refuse
 // every request (fail closed).
@@ -267,6 +279,13 @@ func (e *Engine) buildRoute(r store.Route) (*liveRoute, error) {
 	if r.Config.IsRedirect() {
 		if _, err := url.Parse(r.Config.Redirect.To); err != nil || r.Config.Redirect.To == "" {
 			return nil, errors.New("invalid redirect address")
+		}
+		lr.transport = newTransport(false)
+		return lr, nil
+	}
+	if r.Config.IsConsole() {
+		if r.Config.Access.IsPublic() {
+			return nil, errors.New("consoles must be private")
 		}
 		lr.transport = newTransport(false)
 		return lr, nil
@@ -502,6 +521,16 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if cfg.IsRedirect() {
 		redirect(w, r, cfg.Redirect)
+		return
+	}
+	if cfg.IsConsole() {
+		cb := e.console.Load()
+		user, _ := r.Context().Value(userKey{}).(string)
+		if cb == nil || cb.c == nil || user == "" {
+			WritePage(w, http.StatusServiceUnavailable, "Not available", "Consoles aren't available right now.")
+			return
+		}
+		cb.c.ServeConsole(w, r, &lr.route, user)
 		return
 	}
 	if cfg.LandingPath != "" && r.URL.Path == "/" && r.URL.RawQuery == "" && (r.Method == http.MethodGet || r.Method == http.MethodHead) {

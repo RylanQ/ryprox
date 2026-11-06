@@ -28,6 +28,7 @@ type RouteConfig struct {
 	Paths           []PathRule   `json:"paths"`       // send some paths to other targets
 	LandingPath     string       `json:"landingPath"` // where visitors to "/" are sent, e.g. /page1
 	Redirect        Redirect     `json:"redirect"`
+	Console         Console      `json:"console"` // for ssh, rdp and vnc routes
 	RateLimit       RateLimit    `json:"rateLimit"`
 	ExpiresAt       *time.Time   `json:"expiresAt,omitempty"` // temporary routes stop working after this
 	LoadBalancing   string       `json:"loadBalancing"`       // "round_robin" or "failover"
@@ -72,7 +73,35 @@ func (a Access) Allows(userID int64) bool {
 const (
 	KindProxy    = "proxy"
 	KindRedirect = "redirect"
+	KindSSH      = "ssh" // a terminal in the browser
+	KindRDP      = "rdp" // a Windows desktop in the browser (needs guacd)
+	KindVNC      = "vnc" // a Mac or Linux desktop in the browser (needs guacd)
 )
+
+// IsConsole reports whether the route opens a terminal or desktop in the browser.
+func (c RouteConfig) IsConsole() bool {
+	return c.Kind == KindSSH || c.Kind == KindRDP || c.Kind == KindVNC
+}
+
+// Console auth modes.
+const (
+	ConsoleAuthKey    = "key"    // ssh: RyProx's own SSH key
+	ConsoleAuthAsk    = "ask"    // the person types the password when connecting
+	ConsoleAuthStored = "stored" // rdp/vnc: a password saved (encrypted) by an admin
+)
+
+// Console describes the machine a console route connects to.
+type Console struct {
+	Address     string `json:"address"`  // host:port
+	Username    string `json:"username"` // empty: asked when connecting
+	Auth        string `json:"auth"`
+	Password    string `json:"password,omitempty"` // sealed; never sent to the browser
+	HasPassword bool   `json:"hasPassword"`
+	HostKey     string `json:"hostKey"`    // ssh: expected key fingerprint (SHA256:...), learned on first use if empty
+	Domain      string `json:"domain"`     // rdp
+	Security    string `json:"security"`   // rdp: any, nla, tls, rdp
+	IgnoreCert  bool   `json:"ignoreCert"` // rdp: accept a self-signed certificate
+}
 
 // IsRedirect reports whether the route only redirects visitors elsewhere.
 func (c RouteConfig) IsRedirect() bool { return c.Kind == KindRedirect }

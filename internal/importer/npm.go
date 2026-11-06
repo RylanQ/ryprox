@@ -14,7 +14,6 @@ import (
 	"strings"
 
 	_ "github.com/ncruces/go-sqlite3/driver" // the "sqlite3" driver
-	_ "github.com/ncruces/go-sqlite3/embed"  // the SQLite build
 
 	"github.com/rylanq/ryprox/internal/store"
 )

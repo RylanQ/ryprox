@@ -18,6 +18,7 @@ import (
 
 	"github.com/rylanq/ryprox/internal/api"
 	"github.com/rylanq/ryprox/internal/certs"
+	"github.com/rylanq/ryprox/internal/console"
 	"github.com/rylanq/ryprox/internal/crowdsec"
 	"github.com/rylanq/ryprox/internal/health"
 	"github.com/rylanq/ryprox/internal/proxy"
@@ -78,6 +79,9 @@ func Run(ctx context.Context, o Options) error {
 	}, log)
 	adm.Certs = cm
 	engine.SetGate(adm) // private routes check every request against the access lists
+	adm.Console = &console.Service{Store: st, Box: box, Log: log, UI: o.UI,
+		Audit: func(r *http.Request, actor, action, detail string) { adm.Audit(r, actor, action, detail) }}
+	engine.SetConsole(adm.Console)
 	if o.ACMEDirectory != "" {
 		if err := cm.UseCustomServer(o.ACMEDirectory, o.ACMECAFile); err != nil {
 			return err

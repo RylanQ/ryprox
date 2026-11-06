@@ -169,9 +169,9 @@ func NormalizeRoute(r *store.Route) error {
 	switch c.Kind {
 	case "", store.KindProxy:
 		c.Kind = store.KindProxy
-	case store.KindRedirect:
+	case store.KindRedirect, store.KindSSH, store.KindRDP, store.KindVNC:
 	default:
-		return fieldErr("kind", "choose proxy or redirect")
+		return fieldErr("kind", "choose what this route does")
 	}
 	if c.ExpiresAt != nil {
 		t := c.ExpiresAt.UTC().Truncate(time.Second)
@@ -180,9 +180,12 @@ func NormalizeRoute(r *store.Route) error {
 	if c.RateLimit.RequestsPerMinute < 0 || c.RateLimit.RequestsPerMinute > 1_000_000 {
 		return fieldErr("rateLimit.requestsPerMinute", "enter a number between 0 (no limit) and 1000000")
 	}
-	if c.IsRedirect() {
+	switch {
+	case c.IsRedirect():
 		err = normalizeRedirect(r)
-	} else {
+	case c.IsConsole():
+		err = normalizeConsole(c)
+	default:
 		err = normalizeProxy(c)
 	}
 	if err != nil {
@@ -277,6 +280,72 @@ func normalizeProxy(c *store.RouteConfig) error {
 	}
 	if c.Paths == nil {
 		c.Paths = []store.PathRule{}
+	}
+	return nil
+}
+
+var defaultConsolePorts = map[string]string{store.KindSSH: "22", store.KindRDP: "3389", store.KindVNC: "5900"}
+
+func normalizeConsole(c *store.RouteConfig) error {
+	c.Targets, c.Paths, c.LandingPath, c.Redirect = []store.Target{}, []store.PathRule{}, "", store.Redirect{}
+	c.HealthCheck.Enabled = false
+	c.Websockets = true
+	if c.Access.Mode == store.AccessPublic {
+		return fieldErr("access.mode", "terminals and remote desktops are always private")
+	}
+	k := &c.Console
+	k.Address = strings.TrimSpace(k.Address)
+	host, port, err := net.SplitHostPort(k.Address)
+	if err != nil {
+		host, port = k.Address, defaultConsolePorts[c.Kind]
+	}
+	if host == "" || strings.ContainsAny(host, "/ @?#") || len(host) > 253 {
+		return fieldErr("console.address", "enter the machine's address, like 192.168.1.20 or nas.lan:2222")
+	}
+	var n int
+	if _, err := fmt.Sscanf(port, "%d", &n); err != nil || n < 1 || n > 65535 || fmt.Sprint(n) != port {
+		return fieldErr("console.address", "port must be between 1 and 65535")
+	}
+	k.Address = net.JoinHostPort(strings.Trim(host, "[]"), port)
+	k.Username = strings.TrimSpace(k.Username)
+	if len(k.Username) > 100 || strings.ContainsAny(k.Username, "\r\n\x00") {
+		return fieldErr("console.username", "that username isn't valid")
+	}
+	switch c.Kind {
+	case store.KindSSH:
+		if k.Auth == "" {
+			k.Auth = store.ConsoleAuthKey
+		}
+		if k.Auth != store.ConsoleAuthKey && k.Auth != store.ConsoleAuthAsk {
+			return fieldErr("console.auth", "choose RyProx's key or a password")
+		}
+		k.Password, k.Domain, k.Security, k.IgnoreCert = "", "", "", false
+		k.HostKey = strings.TrimSpace(k.HostKey)
+		if k.HostKey != "" && (!strings.HasPrefix(k.HostKey, "SHA256:") || len(k.HostKey) > 80 || strings.ContainsAny(k.HostKey, " \r\n")) {
+			return fieldErr("console.hostKey", "enter the fingerprint as shown by ssh-keygen -lf, starting with SHA256:")
+		}
+	default:
+		if k.Auth == "" {
+			k.Auth = store.ConsoleAuthAsk
+		}
+		if k.Auth != store.ConsoleAuthAsk && k.Auth != store.ConsoleAuthStored {
+			return fieldErr("console.auth", "choose to ask for the password or save it")
+		}
+		k.HostKey = ""
+		if c.Kind == store.KindVNC {
+			k.Domain, k.Security, k.IgnoreCert = "", "", false
+		} else {
+			switch k.Security {
+			case "":
+				k.Security = "any"
+			case "any", "nla", "tls", "rdp":
+			default:
+				return fieldErr("console.security", "choose a security mode")
+			}
+			if len(k.Domain) > 100 || strings.ContainsAny(k.Domain, "\r\n\x00") {
+				return fieldErr("console.domain", "that domain isn't valid")
+			}
+		}
 	}
 	return nil
 }

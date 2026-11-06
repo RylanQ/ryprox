@@ -487,7 +487,9 @@ function routeRow(r, httpsOn, reload) {
           new Date(r.config.expiresAt) < new Date() ? "Expired" : "Until " + new Date(r.config.expiresAt).toLocaleString([], { dateStyle: "short", timeStyle: "short" })) : null, " ",
         r.config.targets.length > 1 ? (r.config.loadBalancing === "failover" ? "Failover" : "Load balanced") : "")),
     h("div", { class: "wire", "data-state": ws, role: "img", "aria-label": stateLabel, title: stateLabel }),
-    r.config.kind === "redirect"
+    ["ssh", "rdp", "vnc"].includes(r.config.kind)
+      ? h("ul", { class: "targets", "aria-label": "Machine" }, h("li", {}, { ssh: "Terminal", rdp: "Windows desktop", vnc: "Desktop" }[r.config.kind], " · ", r.config.console.address))
+      : r.config.kind === "redirect"
       ? h("ul", { class: "targets", "aria-label": "Redirect" }, h("li", {}, "→ ", r.config.redirect.to, r.config.redirect.keepPath ? "/…" : ""))
       : h("ul", { class: "targets", "aria-label": "Services" },
         [...r.config.targets.map((t) => ["", t]), ...(r.config.paths || []).flatMap((p) => p.targets.map((t) => [p.prefix + " → ", t]))].map(([prefix, t]) => {
@@ -507,6 +509,7 @@ function defaultRoute() {
     config: {
       kind: "proxy", targets: [{ url: "" }], paths: [], landingPath: "",
       redirect: { to: "", code: 301, keepPath: true }, rateLimit: { requestsPerMinute: 0 },
+      console: { address: "", username: "", auth: "", hostKey: "", domain: "", security: "any", ignoreCert: false },
       loadBalancing: "round_robin", tlsSkipVerify: false, websockets: true,
       httpsRedirect: true, preserveHost: false, requestHeaders: [], responseHeaders: [],
       healthCheck: { enabled: false, path: "/", intervalSeconds: 15 },
@@ -534,6 +537,7 @@ async function routeEditor(id) {
       route.config.paths ||= [];
       route.config.redirect = route.config.redirect?.to ? route.config.redirect : { to: "", code: 301, keepPath: true };
       route.config.rateLimit ||= { requestsPerMinute: 0 };
+      route.config.console ||= { address: "", username: "", auth: "" };
       if (!route.config.targets?.length) route.config.targets = [{ url: "" }];
     } catch { return; }
   }
@@ -660,6 +664,53 @@ async function routeEditor(id) {
   // What the route does: proxy to services, or redirect elsewhere.
   const kindProxy = h("input", { type: "radio", name: "kind", value: "proxy", checked: c.kind !== "redirect", "data-field": "kind" });
   const kindRedirect = h("input", { type: "radio", name: "kind", value: "redirect", checked: c.kind === "redirect" });
+  const kindSSH = h("input", { type: "radio", name: "kind", value: "ssh", checked: c.kind === "ssh" });
+  const kindRDP = h("input", { type: "radio", name: "kind", value: "rdp", checked: c.kind === "rdp" });
+  const kindVNC = h("input", { type: "radio", name: "kind", value: "vnc", checked: c.kind === "vnc" });
+  const kindOf = () => [kindProxy, kindRedirect, kindSSH, kindRDP, kindVNC].find((x) => x.checked)?.value || "proxy";
+
+  // Console (SSH / RDP / VNC)
+  const k = c.console;
+  const cAddr = h("input", { type: "text", "data-field": "console.address", value: k.address || "", placeholder: "192.168.1.20", spellcheck: "false", autocapitalize: "off", class: "mono" });
+  const cUser = h("input", { type: "text", "data-field": "console.username", value: k.username || "", placeholder: "Leave empty to ask each time", spellcheck: "false", autocapitalize: "off" });
+  const cAuth = h("select", { "data-field": "console.auth" });
+  const cPass = h("input", { type: "password", "data-field": "console.password", autocomplete: "new-password", placeholder: k.hasPassword ? "Saved (leave empty to keep)" : "" });
+  const cHostKey = h("input", { type: "text", "data-field": "console.hostKey", value: k.hostKey || "", placeholder: "Learned on first connect", spellcheck: "false", class: "mono" });
+  const cDomain = h("input", { type: "text", "data-field": "console.domain", value: k.domain || "", spellcheck: "false" });
+  const cSec = h("select", { "data-field": "console.security" }, h("option", { value: "any" }, "Automatic"), h("option", { value: "nla" }, "NLA"),
+    h("option", { value: "tls" }, "TLS"), h("option", { value: "rdp" }, "Standard RDP"));
+  cSec.value = k.security || "any";
+  const cIgnore = toggle("Accept the PC's self-signed certificate", "Windows uses one by default. Only turn this off if the PC has a trusted certificate.", k.ignoreCert ?? true);
+  const keyNote = h("div", { class: "hint mt" });
+  const passWrap = h("div", {}, field("Password to save", cPass, "Encrypted on this server. Anyone you give access to this route can use it."));
+  const sshOnly = h("div", {}, field("Server key fingerprint", cHostKey, "RyProx refuses to connect if the server's key changes. Leave empty to learn it the first time."),
+    id != null ? h("button", { class: "btn small", type: "button", onclick: async () => {
+      try { await api("DELETE", `/api/routes/${id}/host-key`); toast("The server's key will be learned again on the next connect."); } catch (e) { toast(e.message, "error"); }
+    } }, "Forget learned key") : null, keyNote);
+  const rdpOnly = h("div", {}, h("div", { class: "two" }, field("Windows domain", cDomain, "Usually empty."), field("Security", cSec)), cIgnore);
+  const consoleSection = h("section", { class: "section" },
+    h("header", {}, h("h2", {}, "Machine"), h("p", {}, "The computer to open. People get a sign-in page, then the terminal or desktop, all in the browser.")),
+    field("Address", cAddr, "Its address on your network, optionally with a port (default 22 for SSH, 3389 for RDP, 5900 for VNC)."),
+    field("Username", cUser), field("Sign-in", cAuth), passWrap, sshOnly, rdpOnly);
+  const syncConsole = () => {
+    const kind = kindOf();
+    const opts = kind === "ssh" ? [["key", "RyProx's SSH key (recommended)"], ["ask", "Ask for the password each time"]]
+      : [["ask", "Ask for the password each time"], ["stored", "Save the password here"]];
+    const cur = cAuth.value || k.auth;
+    cAuth.replaceChildren(...opts.map(([v, l]) => h("option", { value: v }, l)));
+    cAuth.value = opts.some(([v]) => v === cur) ? cur : opts[0][0];
+    passWrap.hidden = kind === "ssh" || cAuth.value !== "stored";
+    sshOnly.hidden = kind !== "ssh";
+    rdpOnly.hidden = kind !== "rdp";
+    cUser.parentElement.querySelector("span").textContent = kind === "vnc" ? "Account name (optional, for macOS)" : "Username";
+    if (kind === "ssh" && cAuth.value === "key" && !keyNote.dataset.loaded) {
+      keyNote.dataset.loaded = "1";
+      api("GET", "/api/console").then((r) => keyNote.replaceChildren("Add this line to ~/.ssh/authorized_keys on the server:",
+        h("div", { class: "secret mt" }, r.publicKey), h("button", { class: "btn small mt", type: "button", onclick: () => copy(r.publicKey) }, "Copy"))).catch(() => {});
+    }
+    keyNote.hidden = !(kind === "ssh" && cAuth.value === "key");
+  };
+  cAuth.addEventListener("change", syncConsole);
   const rdTo = h("input", { type: "text", "data-field": "redirect.to", value: c.redirect.to, placeholder: "https://example.com", spellcheck: "false", autocapitalize: "off", class: "mono" });
   const rdCode = h("select", { "data-field": "redirect.code" },
     h("option", { value: "301" }, "Permanent (301)"), h("option", { value: "302" }, "Temporary (302)"),
@@ -715,8 +766,11 @@ async function routeEditor(id) {
       field("Domain name", host, "Point this domain's DNS at this server first."),
       enabled,
       h("label", { class: "switch mt" }, kindProxy, h("span", {}, h("b", {}, "Send to services on my network"), h("small", {}, "A normal reverse proxy route."))),
-      h("label", { class: "switch" }, kindRedirect, h("span", {}, h("b", {}, "Redirect to another address"), h("small", {}, "For example www.example.com to example.com.")))),
-    redirectSection,
+      h("label", { class: "switch" }, kindRedirect, h("span", {}, h("b", {}, "Redirect to another address"), h("small", {}, "For example www.example.com to example.com."))),
+      h("label", { class: "switch" }, kindSSH, h("span", {}, h("b", {}, "Terminal (SSH)"), h("small", {}, "A command line on a server, in the browser."))),
+      h("label", { class: "switch" }, kindRDP, h("span", {}, h("b", {}, "Windows desktop (RDP)"), h("small", {}, "Needs guacd; see Settings."))),
+      h("label", { class: "switch" }, kindVNC, h("span", {}, h("b", {}, "Mac or Linux desktop (VNC)"), h("small", {}, "macOS Screen Sharing or any VNC server. Needs guacd.")))),
+    redirectSection, consoleSection,
     h("section", { class: "section" },
       h("header", {}, h("h2", {}, "Who can open this site?"), h("p", {}, "RyProx checks every request. People must sign in with their password and authenticator code.")),
       h("label", { class: "switch" }, accessPrivate, h("span", {}, h("b", {}, "Only people I choose"), h("small", {}, "Recommended. Everyone else gets a sign-in page."))),
@@ -759,12 +813,16 @@ async function routeEditor(id) {
   accessPublic.addEventListener("change", syncPeople);
   syncPeople();
   const syncKind = () => {
-    const isRedirect = kindRedirect.checked;
-    redirectSection.hidden = !isRedirect;
-    form.querySelectorAll(".proxy-only").forEach((el) => { el.hidden = isRedirect; });
+    const kind = kindOf();
+    redirectSection.hidden = kind !== "redirect";
+    consoleSection.hidden = !["ssh", "rdp", "vnc"].includes(kind);
+    form.querySelectorAll(".proxy-only").forEach((el) => { el.hidden = kind !== "proxy"; });
+    const isConsole = !consoleSection.hidden;
+    accessPublic.disabled = isConsole;
+    if (isConsole && accessPublic.checked) { accessPrivate.checked = true; syncPeople(); }
+    if (isConsole) syncConsole();
   };
-  kindProxy.addEventListener("change", syncKind);
-  kindRedirect.addEventListener("change", syncKind);
+  [kindProxy, kindRedirect, kindSSH, kindRDP, kindVNC].forEach((x) => x.addEventListener("change", syncKind));
   syncKind();
 
   form.addEventListener("submit", async (ev) => {
@@ -774,7 +832,9 @@ async function routeEditor(id) {
       hostname: host.value,
       enabled: enabled.querySelector("input").checked,
       config: {
-        kind: kindRedirect.checked ? "redirect" : "proxy",
+        kind: kindOf(),
+        console: { address: cAddr.value, username: cUser.value, auth: cAuth.value, password: cPass.value, hostKey: cHostKey.value,
+          domain: cDomain.value, security: cSec.value, ignoreCert: cIgnore.querySelector("input").checked },
         redirect: { to: rdTo.value, code: Number(rdCode.value), keepPath: rdKeep.querySelector("input").checked },
         landingPath: landing.value.trim(),
         paths: readPaths(),
@@ -977,6 +1037,7 @@ async function settingsPage() {
   };
 
   const csBox = crowdsecEditor();
+  const rdBox = remoteEditor();
   const pkBox = passkeysBox("/api/account/passkeys");
   const tokBox = tokensBox("/api/account/tokens", true);
   const ssoBox = ssoEditor();
@@ -984,6 +1045,8 @@ async function settingsPage() {
   shell("settings",
     h("div", { class: "page-head" }, h("div", {}, h("h1", {}, "Settings"))),
     h("section", { class: "section" }, h("header", {}, h("h2", {}, "HTTPS")), httpsForm),
+    h("section", { class: "section" }, h("header", {}, h("h2", {}, "Terminals and remote desktops"),
+      h("p", {}, "SSH works out of the box. Windows (RDP) and Mac/VNC desktops go through guacd, Apache Guacamole's connection service, which runs next to RyProx.")), rdBox),
     h("section", { class: "section" }, h("header", {}, h("h2", {}, "CrowdSec"),
       h("p", {}, "Block addresses that CrowdSec has banned, on every site and the sign-in page.")), csBox),
     h("section", { class: "section" }, h("header", {}, h("h2", {}, "Single sign-on"),
@@ -1077,6 +1140,34 @@ function tokensBox(base, allowAdmin) {
           try { await api("DELETE", `${base}/${t.id}`); toast("Token deleted."); out.replaceChildren(); load(); } catch (e) { toast(e.message, "error"); }
         } }, "Delete")))) : h("p", { class: "muted" }, "No tokens yet."),
       form);
+  };
+  load();
+  return box;
+}
+
+function remoteEditor() {
+  const box = h("div", {});
+  const load = async () => {
+    let r;
+    try { r = await api("GET", "/api/console"); } catch { return; }
+    const addr = h("input", { type: "text", "data-field": "guacd", value: r.guacd, class: "mono", spellcheck: "false" });
+    const save = h("button", { class: "btn", type: "submit" }, "Save and test");
+    const form = h("form", { novalidate: true },
+      field("guacd address", addr, "127.0.0.1:4822 when installed on this server, guacd:4822 with the Docker install."),
+      h("p", { class: r.guacdOk ? "muted" : "warn-inline" }, r.guacdOk ? "guacd is running." : `guacd isn't reachable${r.guacdError ? ": " + r.guacdError : ""}. Remote desktops won't work until it is.`),
+      h("div", { class: "actions" }, save),
+      h("h3", { class: "mt-l" }, "RyProx's SSH key"),
+      h("p", { class: "muted" }, "Terminal routes can sign in with this key. Add it to ~/.ssh/authorized_keys on each server."),
+      h("div", { class: "secret" }, r.publicKey),
+      h("div", { class: "row mt" }, h("button", { class: "btn small", type: "button", onclick: () => copy(r.publicKey) }, "Copy")));
+    form.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      clearErrors(form);
+      busy(save, true, "Testing…");
+      try { await api("PUT", "/api/console", { guacd: addr.value.trim() }); load(); }
+      catch (e) { busy(save, false); showError(form, e); }
+    });
+    box.replaceChildren(form);
   };
   load();
   return box;

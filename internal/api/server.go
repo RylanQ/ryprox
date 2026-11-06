@@ -20,6 +20,7 @@ import (
 	"github.com/rylanq/ryprox/internal/auth"
 	"github.com/rylanq/ryprox/internal/certs"
 	"github.com/rylanq/ryprox/internal/config"
+	"github.com/rylanq/ryprox/internal/console"
 	"github.com/rylanq/ryprox/internal/crowdsec"
 	"github.com/rylanq/ryprox/internal/proxy"
 	"github.com/rylanq/ryprox/internal/secrets"
@@ -44,6 +45,9 @@ type Server struct {
 	Box    *secrets.Box
 	Log    *slog.Logger
 	UI     fs.FS // the web/static directory
+
+	// Console opens terminals and remote desktops (optional).
+	Console *console.Service
 
 	// CrowdSec blocks visitors banned by a CrowdSec Local API (optional).
 	CrowdSec *crowdsec.Bouncer
@@ -165,6 +169,10 @@ func (s *Server) Handler() http.Handler {
 		s.deletePasskey(w, r, u)
 	})
 	priv("POST /api/import/npm", s.handleImportNPM)
+	priv("GET /api/console", s.handleGetConsole)
+	priv("PUT /api/console", s.handlePutConsole)
+	priv("GET /api/routes/{id}/host-key", s.handleRouteHostKey)
+	priv("DELETE /api/routes/{id}/host-key", s.handleForgetHostKey)
 	priv("GET /api/crowdsec", s.handleGetCrowdSec)
 	priv("PUT /api/crowdsec", s.handlePutCrowdSec)
 	priv("GET /api/sso", s.handleGetSSO)
@@ -549,6 +557,11 @@ func (s *Server) writeErr(w http.ResponseWriter, err error) {
 		s.Log.Error("internal error", "err", err)
 		writeError(w, http.StatusInternalServerError, "something went wrong; check the RyProx logs")
 	}
+}
+
+// Audit records an action in the activity log.
+func (s *Server) Audit(r *http.Request, actor, action, detail string) {
+	s.audit(r, actor, action, detail)
 }
 
 func (s *Server) audit(r *http.Request, actor, action, detail string) {

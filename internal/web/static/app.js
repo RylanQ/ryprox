@@ -465,15 +465,20 @@ function routeRow(r, httpsOn, reload) {
     h("div", { class: "host" },
       h("a", { href: `${scheme}://${r.hostname}`, target: "_blank", rel: "noopener noreferrer" }, r.hostname),
       h("div", { class: "meta" }, certPill(r.cert, httpsOn), " ", accessPill(r.config.access), " ",
+        r.config.expiresAt ? h("span", { class: "pill " + (new Date(r.config.expiresAt) < new Date() ? "bad" : "wait"), title: fmtTime(r.config.expiresAt) },
+          new Date(r.config.expiresAt) < new Date() ? "Expired" : "Until " + new Date(r.config.expiresAt).toLocaleString([], { dateStyle: "short", timeStyle: "short" })) : null, " ",
         r.config.targets.length > 1 ? (r.config.loadBalancing === "failover" ? "Failover" : "Load balanced") : "")),
     h("div", { class: "wire", "data-state": ws, role: "img", "aria-label": stateLabel, title: stateLabel }),
-    h("ul", { class: "targets", "aria-label": "Services" },
-      r.config.targets.map((t) => {
-        const st = health[t.url];
-        const cls = st?.state === "up" ? "up" : st?.state === "down" ? "down" : "";
-        const tip = st?.state === "down" ? `Down: ${st.lastError || "not responding"}` : st?.state === "up" ? `Up, ${st.latencyMs} ms` : "Not checked";
-        return h("li", { title: tip }, h("span", { class: "dot " + cls, "aria-label": tip }), t.url);
-      })),
+    r.config.kind === "redirect"
+      ? h("ul", { class: "targets", "aria-label": "Redirect" }, h("li", {}, "→ ", r.config.redirect.to, r.config.redirect.keepPath ? "/…" : ""))
+      : h("ul", { class: "targets", "aria-label": "Services" },
+        [...r.config.targets.map((t) => ["", t]), ...(r.config.paths || []).flatMap((p) => p.targets.map((t) => [p.prefix + " → ", t]))].map(([prefix, t]) => {
+          const st = health[t.url];
+          const cls = st?.state === "up" ? "up" : st?.state === "down" ? "down" : "";
+          const tip = st?.state === "down" ? `Down: ${st.lastError || "not responding"}` : st?.state === "up" ? `Up, ${st.latencyMs} ms` : "Not checked";
+          const up = st && st.uptime >= 0 ? h("span", { class: "uptime", title: "Uptime over the last 24 hours" }, `${(st.uptime * 100).toFixed(st.uptime === 1 ? 0 : 1)}%`) : null;
+          return h("li", { title: tip }, h("span", { class: "dot " + cls, "aria-label": tip }), prefix, t.url, up);
+        })),
     h("div", { class: "tools" }, h("a", { class: "btn small", href: `#/routes/${r.id}` }, "Edit")));
 }
 
@@ -482,7 +487,9 @@ function defaultRoute() {
   return {
     hostname: "", enabled: true,
     config: {
-      targets: [{ url: "" }], loadBalancing: "round_robin", tlsSkipVerify: false, websockets: true,
+      kind: "proxy", targets: [{ url: "" }], paths: [], landingPath: "",
+      redirect: { to: "", code: 301, keepPath: true }, rateLimit: { requestsPerMinute: 0 },
+      loadBalancing: "round_robin", tlsSkipVerify: false, websockets: true,
       httpsRedirect: true, preserveHost: false, requestHeaders: [], responseHeaders: [],
       healthCheck: { enabled: false, path: "/", intervalSeconds: 15 },
       access: { mode: "private", users: [] },
@@ -505,6 +512,11 @@ async function routeEditor(id) {
       route.config.responseHeaders ||= [];
       route.config.access ||= { mode: "private", users: [] };
       route.config.access.users ||= [];
+      route.config.kind ||= "proxy";
+      route.config.paths ||= [];
+      route.config.redirect = route.config.redirect?.to ? route.config.redirect : { to: "", code: 301, keepPath: true };
+      route.config.rateLimit ||= { requestsPerMinute: 0 };
+      if (!route.config.targets?.length) route.config.targets = [{ url: "" }];
     } catch { return; }
   }
   const c = route.config;
@@ -627,6 +639,55 @@ async function routeEditor(id) {
   const reqRules = rulesEditor(c.requestHeaders, "requestHeaders", "X-Example");
   const resRules = rulesEditor(c.responseHeaders, "responseHeaders", "X-Frame-Options");
 
+  // What the route does: proxy to services, or redirect elsewhere.
+  const kindProxy = h("input", { type: "radio", name: "kind", value: "proxy", checked: c.kind !== "redirect", "data-field": "kind" });
+  const kindRedirect = h("input", { type: "radio", name: "kind", value: "redirect", checked: c.kind === "redirect" });
+  const rdTo = h("input", { type: "text", "data-field": "redirect.to", value: c.redirect.to, placeholder: "https://example.com", spellcheck: "false", autocapitalize: "off", class: "mono" });
+  const rdCode = h("select", { "data-field": "redirect.code" },
+    h("option", { value: "301" }, "Permanent (301)"), h("option", { value: "302" }, "Temporary (302)"),
+    h("option", { value: "308" }, "Permanent, keep method (308)"), h("option", { value: "307" }, "Temporary, keep method (307)"));
+  rdCode.value = String(c.redirect.code || 301);
+  const rdKeep = toggle("Keep the rest of the address", "www.example.com/a?b=1 goes to example.com/a?b=1, not just example.com.", c.redirect.keepPath);
+  const redirectSection = h("section", { class: "section" },
+    h("header", {}, h("h2", {}, "Redirect"), h("p", {}, "Visitors to this domain are sent straight to another address.")),
+    field("Send visitors to", rdTo, "The full address, starting with https://"),
+    field("Kind of redirect", rdCode, "Use permanent for things like www to the bare domain."),
+    rdKeep);
+
+  // Start page and path rules
+  const landing = h("input", { type: "text", "data-field": "landingPath", value: c.landingPath || "", placeholder: "/page1", spellcheck: "false", autocapitalize: "off", class: "mono" });
+  const plist = h("div", { class: "rules" });
+  const addPath = (rule) => {
+    const prefix = h("input", { type: "text", value: rule.prefix || "", placeholder: "/api", "aria-label": "Path", spellcheck: "false", autocapitalize: "off", class: "mono" });
+    const target = h("input", { type: "text", value: (rule.targets || []).map((t) => t.url).join(", "), placeholder: "http://192.168.1.11:9000", "aria-label": "Service for this path", spellcheck: "false", autocapitalize: "off", class: "mono" });
+    const strip = h("label", { class: "pick", title: "Remove the path before sending, so /api/users reaches the service as /users" },
+      h("input", { type: "checkbox", checked: !!rule.stripPrefix }), h("span", {}, "Strip"));
+    const rm = h("button", { class: "btn small", type: "button", "aria-label": "Remove path rule" }, "Remove");
+    const row = h("div", { class: "rule path-rule" }, prefix, target, strip, rm);
+    rm.addEventListener("click", () => { row.remove(); renumPaths(); });
+    plist.append(row);
+    renumPaths();
+  };
+  const renumPaths = () => [...plist.children].forEach((row, i) => {
+    const [p, t] = row.querySelectorAll("input[type=text]");
+    p.dataset.field = `paths.${i}.prefix`;
+    t.dataset.field = `paths.${i}.targets.0`;
+  });
+  c.paths.forEach(addPath);
+  const readPaths = () => [...plist.children].map((row) => {
+    const [p, t] = row.querySelectorAll("input[type=text]");
+    return { prefix: p.value.trim(), targets: t.value.split(",").map((u) => u.trim()).filter(Boolean).map((url) => ({ url })),
+      stripPrefix: row.querySelector("input[type=checkbox]").checked };
+  });
+
+  // Limits and expiry
+  const rate = h("input", { type: "number", min: 0, max: 1000000, "data-field": "rateLimit.requestsPerMinute", value: c.rateLimit.requestsPerMinute || 0 });
+  const toLocal = (iso) => { const d = new Date(iso); d.setMinutes(d.getMinutes() - d.getTimezoneOffset()); return d.toISOString().slice(0, 16); };
+  const temp = toggle("Temporary route", "Stops working at the time you choose. Handy for sharing something for a day.", !!c.expiresAt);
+  const expires = h("input", { type: "datetime-local", "data-field": "expiresAt", value: c.expiresAt ? toLocal(c.expiresAt) : toLocal(Date.now() + 86400000) });
+  const expiresWrap = h("div", { hidden: !c.expiresAt }, field("Stops working at", expires, "Your local time."));
+  temp.querySelector("input").addEventListener("change", (e) => { expiresWrap.hidden = !e.target.checked; });
+
   const saveBtn = h("button", { class: "btn primary", type: "submit" }, id == null ? "Add route" : "Save changes");
   const delBtn = id == null ? null : h("button", { class: "btn danger", type: "button" }, "Delete route");
 
@@ -634,25 +695,40 @@ async function routeEditor(id) {
     h("section", { class: "section" },
       h("header", {}, h("h2", {}, "Domain")),
       field("Domain name", host, "Point this domain's DNS at this server first."),
-      enabled),
+      enabled,
+      h("label", { class: "switch mt" }, kindProxy, h("span", {}, h("b", {}, "Send to services on my network"), h("small", {}, "A normal reverse proxy route."))),
+      h("label", { class: "switch" }, kindRedirect, h("span", {}, h("b", {}, "Redirect to another address"), h("small", {}, "For example www.example.com to example.com.")))),
+    redirectSection,
     h("section", { class: "section" },
       h("header", {}, h("h2", {}, "Who can open this site?"), h("p", {}, "RyProx checks every request. People must sign in with their password and authenticator code.")),
       h("label", { class: "switch" }, accessPrivate, h("span", {}, h("b", {}, "Only people I choose"), h("small", {}, "Recommended. Everyone else gets a sign-in page."))),
       peopleList, noOne, httpsNote, invitePeople,
       h("label", { class: "switch mt" }, accessPublic, h("span", {}, h("b", {}, "Anyone on the internet"), h("small", {}, "No sign-in. For public websites."))),
       publicWarn),
-    h("section", { class: "section" },
+    h("section", { class: "section proxy-only" },
       h("header", {}, h("h2", {}, "Services"), h("p", {}, "Where visitors are sent. Use the address you'd type on your own network.")),
       tlist,
       h("button", { class: "btn small", type: "button", onclick: () => addTarget("") }, "Add another service"),
-      h("div", { class: "mt" }, lbWrap)),
-    h("section", { class: "section" },
+      h("div", { class: "mt" }, lbWrap),
+      h("p", { class: "muted mt" }, "If the app lives under a sub-path on its server, include it: http://192.168.1.10:8080/app.")),
+    h("section", { class: "section proxy-only" },
+      h("header", {}, h("h2", {}, "Pages and paths"), h("p", {}, "Optional. Open a specific page by default, or send parts of the site to other services.")),
+      field("Start page", landing, "Visitors who open the bare domain land here, for example /page1. Leave empty for the home page."),
+      h("h3", { class: "mt-l" }, "Path rules"),
+      h("p", { class: "muted" }, "Requests starting with the path go to its service. The longest matching path wins."),
+      plist,
+      h("button", { class: "btn small", type: "button", onclick: () => addPath({}) }, "Add path rule")),
+    h("section", { class: "section proxy-only" },
       h("header", {}, h("h2", {}, "Options")),
       redirect, ws, preserve, skip, skipWarn),
     h("section", { class: "section" },
+      h("header", {}, h("h2", {}, "Limits")),
+      field("Requests per minute from one address", rate, "0 means no limit. Visitors over the limit are asked to wait."),
+      temp, expiresWrap),
+    h("section", { class: "section proxy-only" },
       h("header", {}, h("h2", {}, "Health check")),
       hc, hcFields),
-    h("details", { class: "section" },
+    h("details", { class: "section proxy-only" },
       h("summary", {}, h("b", {}, "Header rules"), h("span", { class: "muted" }, " (advanced)")),
       h("div", { class: "mt" },
         h("h3", {}, "Sent to the service"), h("p", { class: "muted" }, "Add or remove headers on requests going to your service."), reqRules.el,
@@ -664,6 +740,14 @@ async function routeEditor(id) {
   accessPrivate.addEventListener("change", syncPeople);
   accessPublic.addEventListener("change", syncPeople);
   syncPeople();
+  const syncKind = () => {
+    const isRedirect = kindRedirect.checked;
+    redirectSection.hidden = !isRedirect;
+    form.querySelectorAll(".proxy-only").forEach((el) => { el.hidden = isRedirect; });
+  };
+  kindProxy.addEventListener("change", syncKind);
+  kindRedirect.addEventListener("change", syncKind);
+  syncKind();
 
   form.addEventListener("submit", async (ev) => {
     ev.preventDefault();
@@ -672,6 +756,12 @@ async function routeEditor(id) {
       hostname: host.value,
       enabled: enabled.querySelector("input").checked,
       config: {
+        kind: kindRedirect.checked ? "redirect" : "proxy",
+        redirect: { to: rdTo.value, code: Number(rdCode.value), keepPath: rdKeep.querySelector("input").checked },
+        landingPath: landing.value.trim(),
+        paths: readPaths(),
+        rateLimit: { requestsPerMinute: Number(rate.value) || 0 },
+        expiresAt: temp.querySelector("input").checked && expires.value ? new Date(expires.value).toISOString() : null,
         targets: [...tlist.querySelectorAll("input")].map((i) => ({ url: i.value })),
         loadBalancing: lb.value,
         tlsSkipVerify: skip.querySelector("input").checked,
@@ -696,6 +786,7 @@ async function routeEditor(id) {
       busy(saveBtn, false);
       // Errors on header rules live inside a closed <details>.
       if (e.field && /Headers/.test(e.field)) form.querySelector("details").open = true;
+      if (e.field && /^paths\.\d+\.targets\.\d+$/.test(e.field)) e.field = e.field.replace(/targets\.\d+$/, "targets.0");
       if (e.field && /^(requestHeaders|responseHeaders)\.\d+$/.test(e.field)) {
         const el = form.querySelector(`[data-field="${e.field}"]`);
         if (el) { el.setAttribute("aria-invalid", "true"); el.focus(); }

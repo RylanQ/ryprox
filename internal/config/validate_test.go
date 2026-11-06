@@ -40,6 +40,7 @@ func TestNormalizeTargetURL(t *testing.T) {
 		"https://192.168.1.2":    "https://192.168.1.2",
 		"http://[::1]:3000":      "http://[::1]:3000",
 		" http://localhost:9000": "http://localhost:9000",
+		"http://x:81/app/":       "http://x:81/app",
 	}
 	for in, want := range good {
 		got, err := NormalizeTargetURL("t", in)
@@ -48,7 +49,7 @@ func TestNormalizeTargetURL(t *testing.T) {
 		}
 	}
 	bad := []string{"", "10.0.0.5:8080", "ftp://x", "http://", "http://user:pw@x",
-		"http://x?y=1", "http://x/#f", "http://x/app", "http://x:0", "http://x:70000", "javascript:alert(1)"}
+		"http://x?y=1", "http://x/#f", "http://x/a/../b", "http://x/a b", "http://x:0", "http://x:70000", "javascript:alert(1)"}
 	for _, in := range bad {
 		if _, err := NormalizeTargetURL("t", in); err == nil {
 			t.Errorf("%q accepted", in)
@@ -137,5 +138,57 @@ func TestNormalizeSettings(t *testing.T) {
 	off := store.Settings{TLSMode: store.TLSModeOff, AuthHostname: "login.example.com"}
 	if err := NormalizeSettings(&off); err == nil {
 		t.Error("sign-in domain without HTTPS accepted")
+	}
+}
+
+func TestNormalizePathsAndLanding(t *testing.T) {
+	r := validRoute()
+	r.Config.LandingPath = "/page1"
+	r.Config.Paths = []store.PathRule{{Prefix: "/api/", Targets: []store.Target{{URL: "http://10.0.0.2:9000"}}, StripPrefix: true}}
+	if err := NormalizeRoute(&r); err != nil {
+		t.Fatal(err)
+	}
+	if r.Config.Paths[0].Prefix != "/api" {
+		t.Fatalf("prefix = %q", r.Config.Paths[0].Prefix)
+	}
+	for _, landing := range []string{"page1", "//evil.com", "https://evil.com", "/a/../b", "/\\evil.com", "/"} {
+		r := validRoute()
+		r.Config.LandingPath = landing
+		if err := NormalizeRoute(&r); err == nil {
+			t.Errorf("landing %q accepted", landing)
+		}
+	}
+	for _, prefix := range []string{"/", "api", "/.ryprox", "/.ryprox/x", "//x", "/a?b"} {
+		r := validRoute()
+		r.Config.Paths = []store.PathRule{{Prefix: prefix, Targets: []store.Target{{URL: "http://10.0.0.2"}}}}
+		if err := NormalizeRoute(&r); err == nil {
+			t.Errorf("prefix %q accepted", prefix)
+		}
+	}
+	r = validRoute()
+	r.Config.Paths = []store.PathRule{{Prefix: "/api"}}
+	if err := NormalizeRoute(&r); err == nil {
+		t.Error("path rule without targets accepted")
+	}
+}
+
+func TestNormalizeRedirect(t *testing.T) {
+	r := store.Route{Hostname: "www.example.com", Config: store.RouteConfig{Kind: store.KindRedirect,
+		Redirect: store.Redirect{To: "https://example.com/", KeepPath: true}}}
+	if err := NormalizeRoute(&r); err != nil {
+		t.Fatal(err)
+	}
+	if r.Config.Redirect.Code != 301 || r.Config.Redirect.To != "https://example.com" || r.Config.Access.Mode != store.AccessPrivate {
+		t.Fatalf("got %+v", r.Config)
+	}
+	for _, to := range []string{"", "example.com", "javascript:alert(1)", "https://www.example.com", "https://u:p@x.com", "//x.com"} {
+		r := store.Route{Hostname: "www.example.com", Config: store.RouteConfig{Kind: store.KindRedirect, Redirect: store.Redirect{To: to}}}
+		if err := NormalizeRoute(&r); err == nil {
+			t.Errorf("redirect to %q accepted", to)
+		}
+	}
+	r.Config.Redirect.Code = 200
+	if err := NormalizeRoute(&r); err == nil {
+		t.Error("code 200 accepted")
 	}
 }

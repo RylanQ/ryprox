@@ -31,6 +31,53 @@ type TargetHealth struct {
 	lastError string
 	latency   time.Duration
 	failUntil atomic.Int64 // unix nanos; set by passive checks
+	hours     [historyHours]hourStat
+}
+
+// historyHours is how far back uptime is kept (in memory; reset on restart).
+const historyHours = 24
+
+type hourStat struct {
+	hour     int64 // unix hour this slot holds
+	up, down int32
+}
+
+func (h *TargetHealth) record(state string, now time.Time) {
+	hr := now.Unix() / 3600
+	slot := &h.hours[hr%historyHours]
+	if slot.hour != hr {
+		*slot = hourStat{hour: hr}
+	}
+	switch state {
+	case StateUp:
+		slot.up++
+	case StateDown:
+		slot.down++
+	}
+}
+
+// history returns uptime per hour, oldest first (-1 where there's no data),
+// and the overall uptime across those hours (-1 if no checks ran).
+func (h *TargetHealth) history(now time.Time) ([]float64, float64) {
+	cur := now.Unix() / 3600
+	out := make([]float64, historyHours)
+	var up, total int32
+	for i := range historyHours {
+		hr := cur - int64(historyHours-1-i)
+		slot := h.hours[((hr%historyHours)+historyHours)%historyHours]
+		n := slot.up + slot.down
+		if slot.hour != hr || n == 0 {
+			out[i] = -1
+			continue
+		}
+		out[i] = float64(slot.up) / float64(n)
+		up += slot.up
+		total += n
+	}
+	if total == 0 {
+		return out, -1
+	}
+	return out, float64(up) / float64(total)
 }
 
 // Usable reports whether traffic should be sent to this target.
@@ -52,6 +99,7 @@ func (h *TargetHealth) set(state, errMsg string, latency time.Duration) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.state, h.lastError, h.latency, h.lastCheck = state, errMsg, latency, time.Now()
+	h.record(state, h.lastCheck)
 }
 
 // TargetStatus is a snapshot of a target's health for the UI.
@@ -61,6 +109,8 @@ type TargetStatus struct {
 	LastCheck time.Time `json:"lastCheck"`
 	LastError string    `json:"lastError,omitempty"`
 	LatencyMs int64     `json:"latencyMs"`
+	Uptime    float64   `json:"uptime"`  // last 24 hours, 0–1, or -1 without data
+	History   []float64 `json:"history"` // per hour, oldest first, -1 without data
 }
 
 func (h *TargetHealth) status(url string) TargetStatus {
@@ -70,7 +120,8 @@ func (h *TargetHealth) status(url string) TargetStatus {
 	if st != StateDown && time.Now().UnixNano() < h.failUntil.Load() {
 		st = StateDown
 	}
-	return TargetStatus{URL: url, State: st, LastCheck: h.lastCheck, LastError: h.lastError, LatencyMs: h.latency.Milliseconds()}
+	hist, up := h.history(time.Now())
+	return TargetStatus{URL: url, State: st, LastCheck: h.lastCheck, LastError: h.lastError, LatencyMs: h.latency.Milliseconds(), Uptime: up, History: hist}
 }
 
 type healthKey struct {
@@ -126,8 +177,11 @@ func (hc *HealthChecker) Sync(routes []store.Route) {
 		if !r.Enabled {
 			continue
 		}
-		for _, t := range r.Config.Targets {
+		for _, t := range r.Config.AllTargets() {
 			k := healthKey{r.ID, t.URL}
+			if contains(hc.routes[r.ID], t.URL) {
+				continue
+			}
 			hc.routes[r.ID] = append(hc.routes[r.ID], t.URL)
 			if r.Config.HealthCheck.Enabled {
 				want[k] = fmt.Sprintf("%s|%d|%t", r.Config.HealthCheck.Path, r.Config.HealthCheck.IntervalSeconds, r.Config.TLSSkipVerify)
@@ -154,7 +208,7 @@ func (hc *HealthChecker) Sync(routes []store.Route) {
 		if !r.Enabled || !r.Config.HealthCheck.Enabled {
 			continue
 		}
-		for _, t := range r.Config.Targets {
+		for _, t := range r.Config.AllTargets() {
 			k := healthKey{r.ID, t.URL}
 			if _, running := hc.checkers[k]; running {
 				continue
@@ -262,5 +316,5 @@ func TestTarget(ctx context.Context, target string, skipVerify bool) TargetStatu
 	}
 	defer client.CloseIdleConnections()
 	state, msg, lat := probe(ctx, client, target)
-	return TargetStatus{URL: target, State: state, LastError: msg, LatencyMs: lat.Milliseconds(), LastCheck: time.Now()}
+	return TargetStatus{URL: target, State: state, LastError: msg, LatencyMs: lat.Milliseconds(), LastCheck: time.Now(), Uptime: -1}
 }

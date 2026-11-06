@@ -269,3 +269,7 @@ dialog::backdrop { background: rgb(10 20 30 / .45); }
 .site-list { list-style: none; padding: 0; margin: 0 0 1rem; display: flex; flex-direction: column; gap: .4rem; }
 .site-list a { display: block; padding: .6rem .8rem; border: 1px solid var(--line); border-radius: var(--radius-s); background: var(--panel); text-decoration: none; }
 .site-list a:hover { border-color: var(--muted); }
+[hidden] { display: none !important; }
+.rule.path-rule { grid-template-columns: 9rem 1fr auto auto; align-items: center; }
+.rule.path-rule .pick { margin: 0; }
+.uptime { font-size: .75rem; color: var(--muted); margin-left: .35rem; }

@@ -172,8 +172,11 @@ func (s *Server) handleSetEnabled(w http.ResponseWriter, r *http.Request, u *sto
 }
 
 func targetList(r *store.Route) string {
+	if r.Config.IsRedirect() {
+		return "redirect to " + r.Config.Redirect.To
+	}
 	var t []string
-	for _, x := range r.Config.Targets {
+	for _, x := range r.Config.AllTargets() {
 		t = append(t, x.URL)
 	}
 	return strings.Join(t, ", ")

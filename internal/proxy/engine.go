@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -117,11 +118,21 @@ type snapshot struct {
 
 type liveRoute struct {
 	route     store.Route
-	targets   []*liveTarget
-	next      atomic.Uint64
+	pools     []*pool // path rules, longest prefix first, then the default ("")
 	transport *http.Transport
 	proxy     *httputil.ReverseProxy
+	limiter   *rateLimiter
 }
+
+// pool is a set of targets serving one path prefix ("" = everything else).
+type pool struct {
+	prefix  string
+	strip   bool
+	targets []*liveTarget
+	next    atomic.Uint64
+}
+
+type poolKey struct{}
 
 type liveTarget struct {
 	url    *url.URL
@@ -200,18 +211,50 @@ func (e *Engine) build(routes []store.Route) (*snapshot, error) {
 	return s, nil
 }
 
-func (e *Engine) buildRoute(r store.Route) (*liveRoute, error) {
-	if len(r.Config.Targets) == 0 {
+func (e *Engine) buildPool(routeID int64, prefix string, strip bool, targets []store.Target) (*pool, error) {
+	if len(targets) == 0 {
 		return nil, errors.New("no targets")
 	}
-	lr := &liveRoute{route: r}
-	for _, t := range r.Config.Targets {
+	p := &pool{prefix: prefix, strip: strip}
+	for _, t := range targets {
 		u, err := url.Parse(t.URL)
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 			return nil, fmt.Errorf("invalid target %q", t.URL)
 		}
-		lr.targets = append(lr.targets, &liveTarget{url: u, health: e.health.Get(r.ID, t.URL)})
+		p.targets = append(p.targets, &liveTarget{url: u, health: e.health.Get(routeID, t.URL)})
 	}
+	return p, nil
+}
+
+func (e *Engine) buildRoute(r store.Route) (*liveRoute, error) {
+	lr := &liveRoute{route: r}
+	if n := r.Config.RateLimit.RequestsPerMinute; n > 0 {
+		lr.limiter = newRateLimiter(n)
+	}
+	if r.Config.IsRedirect() {
+		if _, err := url.Parse(r.Config.Redirect.To); err != nil || r.Config.Redirect.To == "" {
+			return nil, errors.New("invalid redirect address")
+		}
+		lr.transport = newTransport(false)
+		return lr, nil
+	}
+	rules := append([]store.PathRule(nil), r.Config.Paths...)
+	sort.SliceStable(rules, func(i, j int) bool { return len(rules[i].Prefix) > len(rules[j].Prefix) })
+	for _, pr := range rules {
+		if pr.Prefix == "" || !strings.HasPrefix(pr.Prefix, "/") {
+			return nil, fmt.Errorf("invalid path %q", pr.Prefix)
+		}
+		p, err := e.buildPool(r.ID, pr.Prefix, pr.StripPrefix, pr.Targets)
+		if err != nil {
+			return nil, fmt.Errorf("path %s: %w", pr.Prefix, err)
+		}
+		lr.pools = append(lr.pools, p)
+	}
+	def, err := e.buildPool(r.ID, "", false, r.Config.Targets)
+	if err != nil {
+		return nil, err
+	}
+	lr.pools = append(lr.pools, def)
 	lr.transport = newTransport(r.Config.TLSSkipVerify)
 	lr.proxy = &httputil.ReverseProxy{
 		Rewrite:        lr.rewrite,
@@ -245,32 +288,59 @@ func newTransport(skipVerify bool) *http.Transport {
 
 // pick chooses a target, skipping ones known to be down. If every target is
 // down it still tries one, in case the health check is wrong.
-func (lr *liveRoute) pick() *liveTarget {
-	n := len(lr.targets)
+func (p *pool) pick(failover bool) *liveTarget {
+	n := len(p.targets)
 	if n == 1 {
-		return lr.targets[0]
+		return p.targets[0]
 	}
-	if lr.route.Config.LoadBalancing == "failover" {
-		for _, t := range lr.targets {
+	if failover {
+		for _, t := range p.targets {
 			if t.health.Usable() {
 				return t
 			}
 		}
-		return lr.targets[0]
+		return p.targets[0]
 	}
-	start := lr.next.Add(1) - 1
+	start := p.next.Add(1) - 1
 	for i := range n {
-		t := lr.targets[(start+uint64(i))%uint64(n)]
+		t := p.targets[(start+uint64(i))%uint64(n)]
 		if t.health.Usable() {
 			return t
 		}
 	}
-	return lr.targets[start%uint64(n)]
+	return p.targets[start%uint64(n)]
+}
+
+// matches reports whether path falls under the pool's prefix: /api matches
+// /api and /api/x, but not /apix.
+func (p *pool) matches(path string) bool {
+	return p.prefix == "" || path == p.prefix || strings.HasPrefix(path, p.prefix+"/")
+}
+
+// poolFor returns the pool for a request path.
+func (lr *liveRoute) poolFor(path string) *pool {
+	for _, p := range lr.pools {
+		if p.matches(path) {
+			return p
+		}
+	}
+	return lr.pools[len(lr.pools)-1]
 }
 
 func (lr *liveRoute) rewrite(pr *httputil.ProxyRequest) {
-	t := lr.pick()
+	p, _ := pr.In.Context().Value(poolKey{}).(*pool)
+	if p == nil {
+		p = lr.poolFor(pr.In.URL.Path)
+	}
+	t := p.pick(lr.route.Config.LoadBalancing == "failover")
 	pr.Out = pr.Out.WithContext(context.WithValue(pr.Out.Context(), ctxKey{}, t))
+	if p.strip && p.prefix != "" {
+		rest := strings.TrimPrefix(pr.Out.URL.Path, p.prefix)
+		if !strings.HasPrefix(rest, "/") {
+			rest = "/" + rest
+		}
+		pr.Out.URL.Path, pr.Out.URL.RawPath = rest, ""
+	}
 	pr.SetURL(t.url)
 
 	// Rewrite has already removed any X-Forwarded-* headers sent by the
@@ -361,8 +431,18 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		WritePage(w, http.StatusNotFound, "Not found", "No site is configured at this address.")
 		return
 	}
+	cfg := &lr.route.Config
+	if cfg.Expired(time.Now()) {
+		WritePage(w, http.StatusGone, "Link expired", "This address was only available for a limited time.")
+		return
+	}
+	if lr.limiter != nil && !lr.limiter.allow(clientKey(r.RemoteAddr)) {
+		w.Header().Set("Retry-After", "60")
+		WritePage(w, http.StatusTooManyRequests, "Slow down", "Too many requests from your address. Please wait a minute and try again.")
+		return
+	}
 	stripUnsafeHeaders(r.Header)
-	if !lr.route.Config.Access.IsPublic() {
+	if !cfg.Access.IsPublic() {
 		gb := e.gate.Load()
 		if gb == nil || gb.g == nil {
 			WritePage(w, http.StatusServiceUnavailable, "Not available", "This site is private and sign-in isn't available right now.")
@@ -383,12 +463,37 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		r = r.WithContext(ctx)
 	}
+	if cfg.IsRedirect() {
+		redirect(w, r, cfg.Redirect)
+		return
+	}
+	if cfg.LandingPath != "" && r.URL.Path == "/" && r.URL.RawQuery == "" && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
+		http.Redirect(w, r, cfg.LandingPath, http.StatusFound)
+		return
+	}
 	stripRyproxCookies(r.Header)
+	r = r.WithContext(context.WithValue(r.Context(), poolKey{}, lr.poolFor(r.URL.Path)))
 	if isUpgrade(r) && !lr.route.Config.Websockets {
 		WritePage(w, http.StatusForbidden, "Not allowed", "WebSocket connections are turned off for this site.")
 		return
 	}
 	lr.proxy.ServeHTTP(w, r)
+}
+
+// redirect sends the visitor to a redirect route's destination.
+func redirect(w http.ResponseWriter, r *http.Request, rd store.Redirect) {
+	to := rd.To
+	if rd.KeepPath {
+		to += r.URL.EscapedPath()
+		if r.URL.RawQuery != "" {
+			to += "?" + r.URL.RawQuery
+		}
+	}
+	code := rd.Code
+	if code == 0 {
+		code = http.StatusMovedPermanently
+	}
+	http.Redirect(w, r, to, code) //nolint:gosec // destination is admin configuration, not visitor input
 }
 
 // watchAccess cancels a long-lived request once its session stops being

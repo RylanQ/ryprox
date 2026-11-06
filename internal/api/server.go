@@ -20,6 +20,7 @@ import (
 	"github.com/rylanq/ryprox/internal/auth"
 	"github.com/rylanq/ryprox/internal/certs"
 	"github.com/rylanq/ryprox/internal/config"
+	"github.com/rylanq/ryprox/internal/crowdsec"
 	"github.com/rylanq/ryprox/internal/proxy"
 	"github.com/rylanq/ryprox/internal/secrets"
 	"github.com/rylanq/ryprox/internal/store"
@@ -43,6 +44,9 @@ type Server struct {
 	Box    *secrets.Box
 	Log    *slog.Logger
 	UI     fs.FS // the web/static directory
+
+	// CrowdSec blocks visitors banned by a CrowdSec Local API (optional).
+	CrowdSec *crowdsec.Bouncer
 
 	// HTTPClient talks to single sign-on providers (nil: a default client).
 	HTTPClient *http.Client
@@ -86,6 +90,7 @@ func New(ctx context.Context, s *Server) (setupCode string, err error) {
 		return "", err
 	}
 	s.settings.Store(&st)
+	s.startCrowdSec(ctx)
 	n, err := s.Store.CountAdmins(ctx)
 	if err != nil {
 		return "", err
@@ -159,6 +164,9 @@ func (s *Server) Handler() http.Handler {
 	priv("DELETE /api/account/passkeys/{id}", func(w http.ResponseWriter, r *http.Request, u *store.User, _ *store.Session) {
 		s.deletePasskey(w, r, u)
 	})
+	priv("POST /api/import/npm", s.handleImportNPM)
+	priv("GET /api/crowdsec", s.handleGetCrowdSec)
+	priv("PUT /api/crowdsec", s.handlePutCrowdSec)
 	priv("GET /api/sso", s.handleGetSSO)
 	priv("PUT /api/sso", s.handlePutSSO)
 	priv("GET /api/activity/export", s.handleActivityExport)

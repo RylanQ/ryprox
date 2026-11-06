@@ -194,6 +194,7 @@ function render() {
   if (path === "/people") return peoplePage();
   if (path === "/settings") return settingsPage();
   if (path === "/activity") return activityPage();
+  if (path === "/import") return importPage();
   return routesPage();
 }
 
@@ -437,7 +438,7 @@ async function routesPage() {
   const main = shell("routes",
     h("div", { class: "page-head" },
       h("div", {}, h("h1", {}, "Routes"), h("p", { class: "lede" }, "Each route connects a domain to the services behind it. Changes go live as soon as you save.")),
-      h("a", { class: "btn primary", href: "#/routes/new" }, "Add route")),
+      h("div", { class: "row" }, h("a", { class: "btn", href: "#/import" }, "Import"), h("a", { class: "btn primary", href: "#/routes/new" }, "Add route"))),
     board);
 
   const load = async () => {
@@ -975,6 +976,7 @@ async function settingsPage() {
       } }, "Sign out all other devices")) : null);
   };
 
+  const csBox = crowdsecEditor();
   const pkBox = passkeysBox("/api/account/passkeys");
   const tokBox = tokensBox("/api/account/tokens", true);
   const ssoBox = ssoEditor();
@@ -982,6 +984,8 @@ async function settingsPage() {
   shell("settings",
     h("div", { class: "page-head" }, h("div", {}, h("h1", {}, "Settings"))),
     h("section", { class: "section" }, h("header", {}, h("h2", {}, "HTTPS")), httpsForm),
+    h("section", { class: "section" }, h("header", {}, h("h2", {}, "CrowdSec"),
+      h("p", {}, "Block addresses that CrowdSec has banned, on every site and the sign-in page.")), csBox),
     h("section", { class: "section" }, h("header", {}, h("h2", {}, "Single sign-on"),
       h("p", {}, "Let people sign in to private sites with Google, Microsoft, Authentik or another OpenID Connect provider. Only people whose email you've set on the People page can sign in this way.")), ssoBox),
     h("section", { class: "section" }, h("header", {}, h("h2", {}, "Password")), pwForm),
@@ -1076,6 +1080,107 @@ function tokensBox(base, allowAdmin) {
   };
   load();
   return box;
+}
+
+function crowdsecEditor() {
+  const box = h("div", {});
+  let timer = null;
+  const load = async () => {
+    let r;
+    try { r = await api("GET", "/api/crowdsec"); } catch { return; }
+    const on = toggle("Use CrowdSec", "RyProx asks your CrowdSec Local API for bans every 10 seconds and keeps a copy, so lookups are instant.", r.enabled);
+    const url = h("input", { type: "text", "data-field": "url", value: r.url || "http://127.0.0.1:8080", class: "mono", spellcheck: "false" });
+    const key = h("input", { type: "password", "data-field": "apiKey", autocomplete: "off", placeholder: r.hasKey ? "Saved (leave empty to keep)" : "" });
+    const fields = h("div", { hidden: !r.enabled },
+      field("Local API address", url, "Where CrowdSec's Local API listens."),
+      field("Bouncer API key", key, h("span", {}, "Create one on the CrowdSec server with ", h("code", {}, "cscli bouncers add ryprox"), ".")));
+    on.querySelector("input").addEventListener("change", (e) => { fields.hidden = !e.target.checked; });
+    const st = r.status || {};
+    const status = r.enabled ? h("p", { class: st.connected ? "muted" : "warn-inline" },
+      st.connected ? `Connected. ${st.decisions} active ban${st.decisions === 1 ? "" : "s"}, ${st.blocked} request${st.blocked === 1 ? "" : "s"} blocked since start. Last sync ${ago(st.lastSync)}.`
+        : `Not connected${st.lastError ? ": " + st.lastError : " yet"}.`) : null;
+    const save = h("button", { class: "btn primary", type: "submit" }, "Save");
+    const form = h("form", { novalidate: true }, on, fields, status, h("div", { class: "actions" }, save));
+    form.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      clearErrors(form);
+      busy(save, true, "Saving…");
+      try {
+        await api("PUT", "/api/crowdsec", { enabled: on.querySelector("input").checked, url: url.value.trim(), apiKey: key.value.trim() });
+        toast("CrowdSec settings saved.");
+        clearTimeout(timer);
+        timer = setTimeout(load, 1500);
+        load();
+      } catch (e) { busy(save, false); showError(form, e); }
+    });
+    box.replaceChildren(form);
+  };
+  load();
+  return box;
+}
+
+// ---------- import ----------
+async function importPage() {
+  const file = h("input", { type: "file", accept: ".sqlite,.db,application/octet-stream", "aria-label": "Nginx Proxy Manager database" });
+  const btn = h("button", { class: "btn primary", type: "submit" }, "Read file");
+  const out = h("div", {});
+  const form = h("form", { novalidate: true },
+    h("p", {}, "Upload ", h("code", {}, "database.sqlite"), " from Nginx Proxy Manager's ", h("code", {}, "data"), " folder. Nothing changes until you choose what to import."),
+    field("Database file", file), h("div", { class: "actions" }, btn));
+  form.addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    clearErrors(form);
+    if (!file.files[0]) return showError(form, { message: "Choose a file first." });
+    busy(btn, true, "Reading…");
+    let data;
+    try {
+      const res = await fetch("/api/import/npm", { method: "POST", headers: { "X-RyProx": "1", "Content-Type": "application/octet-stream" }, body: file.files[0], credentials: "same-origin" });
+      data = await res.json();
+      if (!res.ok) throw new ApiError(res.status, data);
+    } catch (e) { busy(btn, false); return showError(form, e instanceof ApiError ? e : { message: "Couldn't upload the file." }); }
+    busy(btn, false);
+    if (!data.items.length) { out.replaceChildren(h("p", { class: "muted" }, "No hosts found in that file.")); return; }
+    const rows = data.items.map((it) => {
+      const r = it.route;
+      const cb = h("input", { type: "checkbox", checked: !it.problem, disabled: !!it.problem });
+      const where = r.config.kind === "redirect" ? `→ ${r.config.redirect.to}` : r.config.targets.map((t) => t.url).join(", ") +
+        (r.config.paths?.length ? ` (+${r.config.paths.length} path rule${r.config.paths.length > 1 ? "s" : ""})` : "");
+      const tr = h("tr", {},
+        h("td", {}, cb), h("td", { class: "mono" }, r.hostname),
+        h("td", { class: "mono wrap-any" }, where),
+        h("td", {}, r.config.access.mode === "public" ? "Public" : "Private (you)"),
+        h("td", {}, it.problem ? h("span", { class: "err" }, capitalise(it.problem)) : (it.notes || []).map((n) => h("div", { class: "muted" }, capitalise(n)))));
+      tr.item = it; tr.cb = cb;
+      return tr;
+    });
+    const go2 = h("button", { class: "btn primary", type: "button" }, "Import selected");
+    go2.addEventListener("click", async () => {
+      busy(go2, true, "Importing…");
+      let ok = 0;
+      for (const tr of rows) {
+        if (!tr.cb.checked) continue;
+        const r = tr.item.route;
+        try {
+          await api("POST", "/api/routes", { hostname: r.hostname, enabled: r.enabled, config: r.config });
+          ok++; tr.cb.checked = false; tr.cb.disabled = true;
+          tr.lastChild.replaceChildren(h("span", {}, "Imported"));
+        } catch (e) { tr.lastChild.replaceChildren(h("span", { class: "err" }, capitalise(e.message))); }
+      }
+      busy(go2, false);
+      toast(`${ok} route${ok === 1 ? "" : "s"} imported.`);
+    });
+    out.replaceChildren(
+      h("h2", { class: "mt-l" }, "Found"),
+      h("p", { class: "muted" }, "Imported sites are private to you at first. Review each one afterwards to choose who can open it."),
+      h("div", { class: "table-wrap" }, h("table", { class: "table" },
+        h("thead", {}, h("tr", {}, ["", "Domain", "Goes to", "Access", "Notes"].map((x) => h("th", { scope: "col" }, x)))),
+        h("tbody", {}, rows))),
+      h("div", { class: "actions" }, go2, h("a", { class: "btn", href: "#/" }, "Done")));
+  });
+  shell("routes",
+    h("div", { class: "page-head" }, h("div", {}, h("h1", {}, "Import from Nginx Proxy Manager"),
+      h("p", { class: "lede" }, "Bring your proxy hosts and redirects across."))),
+    h("section", { class: "section" }, form), out);
 }
 
 function ssoEditor() {

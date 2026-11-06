@@ -111,6 +111,10 @@ func (s *Server) readRoute(w http.ResponseWriter, r *http.Request) (*store.Route
 		s.writeErr(w, err)
 		return nil, false
 	}
+	if err := s.checkSites(r, rt); err != nil {
+		s.writeErr(w, err)
+		return nil, false
+	}
 	return rt, true
 }
 
@@ -239,6 +243,7 @@ func (s *Server) handleTestTarget(w http.ResponseWriter, r *http.Request, _ *sto
 		URL           string `json:"url"`
 		TLSSkipVerify bool   `json:"tlsSkipVerify"`
 		Path          string `json:"path"`
+		Site          int64  `json:"site"`
 	}
 	if !readJSON(w, r, &in) {
 		return
@@ -252,7 +257,7 @@ func (s *Server) handleTestTarget(w http.ResponseWriter, r *http.Request, _ *sto
 	if in.Path != "" && strings.HasPrefix(in.Path, "/") && !strings.HasPrefix(in.Path, "//") {
 		path = in.Path
 	}
-	writeJSON(w, http.StatusOK, proxy.TestTarget(r.Context(), u+path, in.TLSSkipVerify))
+	writeJSON(w, http.StatusOK, s.Engine.TestTarget(r.Context(), u+path, in.TLSSkipVerify, in.Site))
 }
 
 func (s *Server) handleCertificates(w http.ResponseWriter, r *http.Request, _ *store.User, _ *store.Session) {

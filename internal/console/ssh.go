@@ -150,7 +150,13 @@ func (s *Service) runSSH(ctx context.Context, c *websocket.Conn, route *store.Ro
 		})}
 	}
 	dctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	raw, err := (&net.Dialer{}).DialContext(dctx, "tcp", k.Address)
+	var raw net.Conn
+	var err error
+	if s.Dial != nil {
+		raw, err = s.Dial(dctx, k.Site, k.Address)
+	} else {
+		raw, err = (&net.Dialer{}).DialContext(dctx, "tcp", k.Address)
+	}
 	cancel()
 	if err != nil {
 		closeWith(c, "Couldn't reach "+k.Address)

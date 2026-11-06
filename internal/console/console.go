@@ -43,6 +43,10 @@ type Service struct {
 	Box   *secrets.Box
 	Log   *slog.Logger
 	UI    fs.FS // the web/static directory
+	// DefaultGuacd is used when no guacd address is saved (e.g. guacd:4822 in Docker).
+	DefaultGuacd string
+	// Dial reaches a machine, through a site's tunnel when site != 0.
+	Dial func(ctx context.Context, site int64, addr string) (net.Conn, error)
 	// Audit records who connected where.
 	Audit func(r *http.Request, actor, action, detail string)
 

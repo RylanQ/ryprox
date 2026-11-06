@@ -37,13 +37,17 @@ type GuacdConfig struct {
 
 // Guacd returns the configured guacd address.
 func (s *Service) Guacd(ctx context.Context) string {
+	def := defaultGuacd
+	if s.DefaultGuacd != "" {
+		def = s.DefaultGuacd
+	}
 	raw, err := s.Store.GetJSONSetting(ctx, guacdSetting)
 	if err != nil || raw == "" {
-		return defaultGuacd
+		return def
 	}
 	var c GuacdConfig
 	if json.Unmarshal([]byte(raw), &c) != nil || c.Address == "" {
-		return defaultGuacd
+		return def
 	}
 	return c.Address
 }

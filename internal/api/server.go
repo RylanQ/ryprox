@@ -25,6 +25,7 @@ import (
 	"github.com/rylanq/ryprox/internal/proxy"
 	"github.com/rylanq/ryprox/internal/secrets"
 	"github.com/rylanq/ryprox/internal/store"
+	"github.com/rylanq/ryprox/internal/tunnel"
 	"github.com/rylanq/ryprox/internal/version"
 )
 
@@ -45,6 +46,9 @@ type Server struct {
 	Box    *secrets.Box
 	Log    *slog.Logger
 	UI     fs.FS // the web/static directory
+
+	// Tunnels reaches services on remote sites through connected agents.
+	Tunnels *tunnel.Hub
 
 	// Console opens terminals and remote desktops (optional).
 	Console *console.Service
@@ -169,6 +173,10 @@ func (s *Server) Handler() http.Handler {
 		s.deletePasskey(w, r, u)
 	})
 	priv("POST /api/import/npm", s.handleImportNPM)
+	priv("GET /api/sites", s.handleListSites)
+	priv("POST /api/sites", s.handleCreateSite)
+	priv("POST /api/sites/{id}/token", s.handleSiteToken)
+	priv("DELETE /api/sites/{id}", s.handleDeleteSite)
 	priv("GET /api/console", s.handleGetConsole)
 	priv("PUT /api/console", s.handlePutConsole)
 	priv("GET /api/routes/{id}/host-key", s.handleRouteHostKey)

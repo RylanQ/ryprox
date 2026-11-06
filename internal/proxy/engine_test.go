@@ -344,7 +344,7 @@ func TestHealthChecks(t *testing.T) {
 	_ = e.Apply([]store.Route{r})
 	waitFor(StateDown)
 
-	st := TestTarget(t.Context(), backend.URL+"/health", false)
+	st := e.TestTarget(t.Context(), backend.URL+"/health", false, 0)
 	if st.State != StateDown || st.LastError != "HTTP 503" {
 		t.Fatalf("TestTarget = %+v", st)
 	}

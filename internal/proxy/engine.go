@@ -33,6 +33,59 @@ type Engine struct {
 	log     *slog.Logger
 	gate    atomic.Pointer[gateBox]
 	console atomic.Pointer[consoleBox]
+	tunnels atomic.Pointer[dialerBox]
+}
+
+// Dialer connects to an address inside a remote site, through its tunnel.
+type Dialer interface {
+	Dial(ctx context.Context, siteID int64, addr string) (net.Conn, error)
+}
+
+type dialerBox struct{ d Dialer }
+
+// SetTunnels installs the tunnel hub used for targets on remote sites.
+func (e *Engine) SetTunnels(d Dialer) { e.tunnels.Store(&dialerBox{d}) }
+
+type dialFunc func(ctx context.Context, network, addr string) (net.Conn, error)
+
+var directDialer = (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext
+
+// dialerFor returns a dial function that sends addresses listed in sites
+// (host:port → site ID) through that site's tunnel, and everything else directly.
+func (e *Engine) dialerFor(sites map[string]int64) dialFunc {
+	if len(sites) == 0 {
+		return directDialer
+	}
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		site, ok := sites[addr]
+		if !ok {
+			return directDialer(ctx, network, addr)
+		}
+		tb := e.tunnels.Load()
+		if tb == nil || tb.d == nil {
+			return nil, errors.New("tunnels aren't available")
+		}
+		return tb.d.Dial(ctx, site, addr)
+	}
+}
+
+// hostPort returns a URL's host:port, filling in the scheme's default port.
+func hostPort(u *url.URL) string {
+	if u.Port() != "" {
+		return u.Host
+	}
+	if u.Scheme == "https" {
+		return net.JoinHostPort(u.Hostname(), "443")
+	}
+	return net.JoinHostPort(u.Hostname(), "80")
+}
+
+// DialTarget connects to host:port, through a site's tunnel when site != 0.
+func (e *Engine) DialTarget(ctx context.Context, site int64, addr string) (net.Conn, error) {
+	if site == 0 {
+		return directDialer(ctx, "tcp", addr)
+	}
+	return e.dialerFor(map[string]int64{addr: site})(ctx, "tcp", addr)
 }
 
 // PortalPrefix is the path RyProx reserves on private sites for its own
@@ -189,6 +242,7 @@ type ctxKey struct{}
 // NewEngine returns an engine with no routes.
 func NewEngine(log *slog.Logger) *Engine {
 	e := &Engine{log: log, health: NewHealthChecker(log)}
+	e.health.dialer = e.dialerFor
 	e.snap.Store(&snapshot{routes: map[string]*liveRoute{}})
 	return e
 }
@@ -280,14 +334,14 @@ func (e *Engine) buildRoute(r store.Route) (*liveRoute, error) {
 		if _, err := url.Parse(r.Config.Redirect.To); err != nil || r.Config.Redirect.To == "" {
 			return nil, errors.New("invalid redirect address")
 		}
-		lr.transport = newTransport(false)
+		lr.transport = newTransport(false, directDialer)
 		return lr, nil
 	}
 	if r.Config.IsConsole() {
 		if r.Config.Access.IsPublic() {
 			return nil, errors.New("consoles must be private")
 		}
-		lr.transport = newTransport(false)
+		lr.transport = newTransport(false, directDialer)
 		return lr, nil
 	}
 	rules := append([]store.PathRule(nil), r.Config.Paths...)
@@ -307,7 +361,13 @@ func (e *Engine) buildRoute(r store.Route) (*liveRoute, error) {
 		return nil, err
 	}
 	lr.pools = append(lr.pools, def)
-	lr.transport = newTransport(r.Config.TLSSkipVerify)
+	sites := map[string]int64{}
+	for _, t := range r.Config.AllTargets() {
+		if u, err := url.Parse(t.URL); err == nil && t.Site != 0 {
+			sites[hostPort(u)] = t.Site
+		}
+	}
+	lr.transport = newTransport(r.Config.TLSSkipVerify, e.dialerFor(sites))
 	lr.proxy = &httputil.ReverseProxy{
 		Rewrite:        lr.rewrite,
 		Transport:      lr.transport,
@@ -318,13 +378,10 @@ func (e *Engine) buildRoute(r store.Route) (*liveRoute, error) {
 	return lr, nil
 }
 
-func newTransport(skipVerify bool) *http.Transport {
+func newTransport(skipVerify bool, dial dialFunc) *http.Transport {
 	return &http.Transport{
-		Proxy: nil, // never route backend traffic through an environment proxy
-		DialContext: (&net.Dialer{
-			Timeout:   10 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
+		Proxy:                 nil, // never route backend traffic through an environment proxy
+		DialContext:           dial,
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          200,
 		MaxIdleConnsPerHost:   50,

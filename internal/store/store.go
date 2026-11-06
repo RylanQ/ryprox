@@ -164,6 +164,16 @@ CREATE TABLE identities (
 	UNIQUE (provider, subject)
 );
 `,
+	// 4: remote sites reached through tunnels
+	`
+CREATE TABLE sites (
+	id           INTEGER PRIMARY KEY AUTOINCREMENT,
+	name         TEXT    NOT NULL UNIQUE COLLATE NOCASE,
+	token_hash   BLOB    NOT NULL UNIQUE,
+	created_at   INTEGER NOT NULL,
+	last_seen_at INTEGER NOT NULL DEFAULT 0
+);
+`,
 }
 
 func (s *Store) migrate(ctx context.Context) error {

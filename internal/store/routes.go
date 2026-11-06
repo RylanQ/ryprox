@@ -97,10 +97,11 @@ type Console struct {
 	Auth        string `json:"auth"`
 	Password    string `json:"password,omitempty"` // sealed; never sent to the browser
 	HasPassword bool   `json:"hasPassword"`
-	HostKey     string `json:"hostKey"`    // ssh: expected key fingerprint (SHA256:...), learned on first use if empty
-	Domain      string `json:"domain"`     // rdp
-	Security    string `json:"security"`   // rdp: any, nla, tls, rdp
-	IgnoreCert  bool   `json:"ignoreCert"` // rdp: accept a self-signed certificate
+	HostKey     string `json:"hostKey"`        // ssh: expected key fingerprint (SHA256:...), learned on first use if empty
+	Domain      string `json:"domain"`         // rdp
+	Security    string `json:"security"`       // rdp: any, nla, tls, rdp
+	IgnoreCert  bool   `json:"ignoreCert"`     // rdp: accept a self-signed certificate
+	Site        int64  `json:"site,omitempty"` // ssh: reached through this site's tunnel
 }
 
 // IsRedirect reports whether the route only redirects visitors elsewhere.
@@ -142,7 +143,8 @@ type RateLimit struct {
 
 // Target is one backend server, e.g. http://10.0.0.5:8080.
 type Target struct {
-	URL string `json:"url"`
+	URL  string `json:"url"`
+	Site int64  `json:"site,omitempty"` // reached through this site's tunnel (0: directly)
 }
 
 // HeaderRule sets or removes one header.

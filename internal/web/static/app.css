@@ -285,3 +285,8 @@ dialog::backdrop { background: rgb(10 20 30 / .45); }
 code { font-family: var(--mono); font-size: .85em; background: var(--panel-2); padding: .1rem .3rem; border-radius: var(--radius-s); word-break: break-all; }
 .sso-buttons { display: grid; gap: .5rem; }
 .sso-buttons .btn { justify-content: center; text-align: center; }
+.target-item select { flex: 0 1 12rem; }
+.rule.path-rule.with-site { grid-template-columns: 8rem 1fr 10rem auto auto; }
+@media (max-width: 640px) { .rule.path-rule, .rule.path-rule.with-site { grid-template-columns: 1fr 1fr; } }
+pre.secret { white-space: pre-wrap; margin: .4rem 0; }
+.actions.end { align-self: end; }

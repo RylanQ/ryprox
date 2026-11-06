@@ -24,6 +24,7 @@ import (
 	"github.com/rylanq/ryprox/internal/proxy"
 	"github.com/rylanq/ryprox/internal/secrets"
 	"github.com/rylanq/ryprox/internal/store"
+	"github.com/rylanq/ryprox/internal/tunnel"
 )
 
 // Options configure a RyProx instance. Everything else is set in the UI.
@@ -35,6 +36,7 @@ type Options struct {
 	// Advanced: get certificates from another ACME server instead of Let's Encrypt.
 	ACMEDirectory string
 	ACMECAFile    string
+	Guacd         string // default guacd address (the dashboard setting wins)
 	Log           *slog.Logger
 	UI            fs.FS
 	// Ready, if set, is called once all listeners are open.
@@ -79,9 +81,13 @@ func Run(ctx context.Context, o Options) error {
 	}, log)
 	adm.Certs = cm
 	engine.SetGate(adm) // private routes check every request against the access lists
-	adm.Console = &console.Service{Store: st, Box: box, Log: log, UI: o.UI,
+	adm.Console = &console.Service{Store: st, Box: box, Log: log, UI: o.UI, DefaultGuacd: o.Guacd,
 		Audit: func(r *http.Request, actor, action, detail string) { adm.Audit(r, actor, action, detail) }}
 	engine.SetConsole(adm.Console)
+	hub := tunnel.NewHub(log)
+	adm.Tunnels = hub
+	engine.SetTunnels(hub)
+	adm.Console.Dial = engine.DialTarget
 	if o.ACMEDirectory != "" {
 		if err := cm.UseCustomServer(o.ACMEDirectory, o.ACMECAFile); err != nil {
 			return err

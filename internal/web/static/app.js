@@ -195,6 +195,7 @@ function render() {
   if (path === "/settings") return settingsPage();
   if (path === "/activity") return activityPage();
   if (path === "/import") return importPage();
+  if (path === "/sites") return sitesPage();
   return routesPage();
 }
 
@@ -211,6 +212,7 @@ function shell(current, ...content) {
       h("nav", { class: "nav", "aria-label": "Main" },
         link("#/", "Routes", "routes"),
         link("#/people", "People", "people"),
+        link("#/sites", "Sites", "sites"),
         link("#/certificates", "Certificates", "certs"),
         link("#/activity", "Activity", "activity"),
         link("#/settings", "Settings", "settings")),
@@ -521,7 +523,11 @@ function defaultRoute() {
 async function routeEditor(id) {
   let route = defaultRoute();
   let people, settings;
-  try { [people, settings] = await Promise.all([api("GET", "/api/people"), api("GET", "/api/settings")]); } catch { return; }
+  let sites = [];
+  try { [people, settings, { sites }] = await Promise.all([api("GET", "/api/people"), api("GET", "/api/settings"), api("GET", "/api/sites")]); } catch { return; }
+  const siteSelect = (value, label) => h("select", { "aria-label": label || "Reached" },
+    h("option", { value: "0" }, "Directly"),
+    sites.map((x) => h("option", { value: String(x.id), selected: x.id === value }, `Through ${x.name}`)));
   if (id == null) route.config.access.users = [people.me]; // you, to start with
   if (id != null) {
     try {
@@ -576,8 +582,9 @@ async function routeEditor(id) {
 
   // Targets
   const tlist = h("div", { class: "target-list" });
-  const addTarget = (url) => {
+  const addTarget = (url, site) => {
     const input = h("input", { type: "text", value: url, placeholder: "http://192.168.1.10:8080", spellcheck: "false", autocapitalize: "off", "aria-label": "Service address" });
+    const via = sites.length ? siteSelect(site || 0, "How RyProx reaches this service") : null;
     const result = h("div", { class: "test-result", hidden: true });
     const testBtn = h("button", { class: "btn small", type: "button" }, "Test");
     testBtn.addEventListener("click", async () => {
@@ -585,7 +592,7 @@ async function routeEditor(id) {
       result.hidden = false;
       result.replaceChildren(h("span", { class: "muted" }, "Connecting…"));
       try {
-        const st = await api("POST", "/api/test-target", { url: input.value, tlsSkipVerify: skip.querySelector("input").checked });
+        const st = await api("POST", "/api/test-target", { url: input.value, tlsSkipVerify: skip.querySelector("input").checked, site: via ? Number(via.value) : 0 });
         result.replaceChildren(st.state === "up"
           ? h("span", {}, h("span", { class: "dot up" }), ` Reachable in ${st.latencyMs} ms`)
           : h("span", { class: "err" }, h("span", { class: "dot down" }), ` Not reachable: ${st.lastError}`));
@@ -594,7 +601,7 @@ async function routeEditor(id) {
       } finally { busy(testBtn, false); }
     });
     const rm = h("button", { class: "btn small", type: "button", "aria-label": "Remove service" }, "Remove");
-    const item = h("div", { class: "target-item" }, input, testBtn, rm, result);
+    const item = h("div", { class: "target-item" + (via ? " with-site" : "") }, input, via, testBtn, rm, result);
     rm.addEventListener("click", () => { if (tlist.children.length > 1) { item.remove(); renumber(); } });
     tlist.append(item);
     renumber();
@@ -617,7 +624,7 @@ async function routeEditor(id) {
     });
     lbWrap.hidden = tlist.children.length < 2;
   };
-  c.targets.forEach((t) => addTarget(t.url));
+  c.targets.forEach((t) => addTarget(t.url, t.site));
 
   // Options
   const redirect = toggle("Redirect HTTP to HTTPS", "Visitors who type http:// are sent to the secure address.", c.httpsRedirect);
@@ -688,9 +695,12 @@ async function routeEditor(id) {
       try { await api("DELETE", `/api/routes/${id}/host-key`); toast("The server's key will be learned again on the next connect."); } catch (e) { toast(e.message, "error"); }
     } }, "Forget learned key") : null, keyNote);
   const rdpOnly = h("div", {}, h("div", { class: "two" }, field("Windows domain", cDomain, "Usually empty."), field("Security", cSec)), cIgnore);
+  const cSite = sites.length ? siteSelect(k.site || 0, "How RyProx reaches this machine") : null;
+  if (cSite) cSite.dataset.field = "console.site";
   const consoleSection = h("section", { class: "section" },
     h("header", {}, h("h2", {}, "Machine"), h("p", {}, "The computer to open. People get a sign-in page, then the terminal or desktop, all in the browser.")),
     field("Address", cAddr, "Its address on your network, optionally with a port (default 22 for SSH, 3389 for RDP, 5900 for VNC)."),
+    cSite ? field("Reached", cSite, "Terminals can go through a site connector. Remote desktops need a direct connection for now.") : null,
     field("Username", cUser), field("Sign-in", cAuth), passWrap, sshOnly, rdpOnly);
   const syncConsole = () => {
     const kind = kindOf();
@@ -732,7 +742,8 @@ async function routeEditor(id) {
     const strip = h("label", { class: "pick", title: "Remove the path before sending, so /api/users reaches the service as /users" },
       h("input", { type: "checkbox", checked: !!rule.stripPrefix }), h("span", {}, "Strip"));
     const rm = h("button", { class: "btn small", type: "button", "aria-label": "Remove path rule" }, "Remove");
-    const row = h("div", { class: "rule path-rule" }, prefix, target, strip, rm);
+    const via = sites.length ? siteSelect(rule.targets?.[0]?.site || 0, "How RyProx reaches this path's service") : null;
+    const row = h("div", { class: "rule path-rule" + (via ? " with-site" : "") }, prefix, target, via, strip, rm);
     rm.addEventListener("click", () => { row.remove(); renumPaths(); });
     plist.append(row);
     renumPaths();
@@ -745,7 +756,8 @@ async function routeEditor(id) {
   c.paths.forEach(addPath);
   const readPaths = () => [...plist.children].map((row) => {
     const [p, t] = row.querySelectorAll("input[type=text]");
-    return { prefix: p.value.trim(), targets: t.value.split(",").map((u) => u.trim()).filter(Boolean).map((url) => ({ url })),
+    const site = Number(row.querySelector("select")?.value || 0);
+    return { prefix: p.value.trim(), targets: t.value.split(",").map((u) => u.trim()).filter(Boolean).map((url) => ({ url, site })),
       stripPrefix: row.querySelector("input[type=checkbox]").checked };
   });
 
@@ -780,7 +792,7 @@ async function routeEditor(id) {
     h("section", { class: "section proxy-only" },
       h("header", {}, h("h2", {}, "Services"), h("p", {}, "Where visitors are sent. Use the address you'd type on your own network.")),
       tlist,
-      h("button", { class: "btn small", type: "button", onclick: () => addTarget("") }, "Add another service"),
+      h("button", { class: "btn small", type: "button", onclick: () => addTarget("", 0) }, "Add another service"),
       h("div", { class: "mt" }, lbWrap),
       h("p", { class: "muted mt" }, "If the app lives under a sub-path on its server, include it: http://192.168.1.10:8080/app.")),
     h("section", { class: "section proxy-only" },
@@ -833,14 +845,14 @@ async function routeEditor(id) {
       enabled: enabled.querySelector("input").checked,
       config: {
         kind: kindOf(),
-        console: { address: cAddr.value, username: cUser.value, auth: cAuth.value, password: cPass.value, hostKey: cHostKey.value,
+        console: { site: cSite ? Number(cSite.value) : 0, address: cAddr.value, username: cUser.value, auth: cAuth.value, password: cPass.value, hostKey: cHostKey.value,
           domain: cDomain.value, security: cSec.value, ignoreCert: cIgnore.querySelector("input").checked },
         redirect: { to: rdTo.value, code: Number(rdCode.value), keepPath: rdKeep.querySelector("input").checked },
         landingPath: landing.value.trim(),
         paths: readPaths(),
         rateLimit: { requestsPerMinute: Number(rate.value) || 0 },
         expiresAt: temp.querySelector("input").checked && expires.value ? new Date(expires.value).toISOString() : null,
-        targets: [...tlist.querySelectorAll("input")].map((i) => ({ url: i.value })),
+        targets: [...tlist.children].map((item) => ({ url: item.querySelector("input").value, site: Number(item.querySelector("select")?.value || 0) })),
         loadBalancing: lb.value,
         tlsSkipVerify: skip.querySelector("input").checked,
         websockets: ws.querySelector("input").checked,
@@ -1208,6 +1220,70 @@ function crowdsecEditor() {
   };
   load();
   return box;
+}
+
+// ---------- sites (tunnels) ----------
+function connectorHelp(server, token) {
+  const docker = `docker run -d --name ryprox-connect --restart unless-stopped --network host \\\n  -e RYPROX_SERVER=${server} -e RYPROX_TOKEN=${token} \\\n  ghcr.io/rylanq/ryprox connect`;
+  const bin = `RYPROX_SERVER=${server} RYPROX_TOKEN=${token} ryprox connect`;
+  return h("div", { class: "banner" },
+    h("p", {}, h("b", {}, "Copy this now. "), "The token won't be shown again. Run the connector on any computer in that network, then use this site on your routes."),
+    h("h3", {}, "With Docker"), h("pre", { class: "secret" }, docker),
+    h("div", { class: "row" }, h("button", { class: "btn small", type: "button", onclick: () => copy(docker.replace(/\\\n\s*/g, "")) }, "Copy")),
+    h("h3", { class: "mt" }, "With the ryprox program"), h("pre", { class: "secret" }, bin),
+    h("div", { class: "row" }, h("button", { class: "btn small", type: "button", onclick: () => copy(bin) }, "Copy")),
+    h("p", { class: "muted mt" }, "Run it on two machines for redundancy: RyProx uses whichever is online. Add RYPROX_ALLOW=192.168.1.0/24 to limit what RyProx can reach there."));
+}
+
+async function sitesPage() {
+  const list = h("div", { "aria-busy": "true" });
+  const out = h("div", {});
+  const name = h("input", { type: "text", "data-field": "name", placeholder: "Home", maxlength: 60 });
+  const add = h("button", { class: "btn primary", type: "submit" }, "Add site");
+  const form = h("form", { novalidate: true, class: "section" },
+    h("header", {}, h("h2", {}, "Add a site")),
+    h("div", { class: "two" }, field("Name", name, "The network, e.g. Home or Office."), h("div", { class: "actions end" }, add)));
+  const load = async () => {
+    let r;
+    try { r = await api("GET", "/api/sites"); } catch { return; }
+    list.removeAttribute("aria-busy");
+    if (!r.server) out.replaceChildren(h("div", { class: "warn-inline" }, "Set a sign-in domain in Settings first: connectors connect there."));
+    list.replaceChildren(r.sites.length ? h("div", { class: "table-wrap" }, h("table", { class: "table" },
+      h("thead", {}, h("tr", {}, ["Site", "Connectors", "Last connected", ""].map((x) => h("th", { scope: "col" }, x)))),
+      h("tbody", {}, r.sites.map((x) => h("tr", {},
+        h("td", {}, h("b", {}, x.name)),
+        h("td", {}, x.online ? h("span", {}, h("span", { class: "dot up" }), ` ${x.agents.length} online`, h("div", { class: "muted mono" }, x.agents.map((a) => a.remote).join(", ")))
+          : h("span", {}, h("span", { class: "dot down" }), " Offline")),
+        h("td", {}, x.lastSeenAt && !x.lastSeenAt.startsWith("0001") ? ago(x.lastSeenAt) : "Never"),
+        h("td", {}, h("div", { class: "row" },
+          h("button", { class: "btn small", type: "button", onclick: async () => {
+            if (!(await confirmDialog("Make a new token?", `Connectors for ${x.name} are disconnected until they use the new token.`, "New token"))) return;
+            try { const t = await api("POST", `/api/sites/${x.id}/token`, {}); out.replaceChildren(connectorHelp(t.server, t.token)); load(); } catch (e) { toast(e.message, "error"); }
+          } }, "New token"),
+          h("button", { class: "btn small danger", type: "button", onclick: async () => {
+            if (!(await confirmDialog(`Delete ${x.name}?`, "Its connectors are disconnected.", "Delete"))) return;
+            try { await api("DELETE", `/api/sites/${x.id}`); toast("Site deleted."); load(); } catch (e) { toast(e.message, "error"); }
+          } }, "Delete")))))))) : h("div", { class: "empty" }, h("h2", {}, "No sites yet"),
+        h("p", {}, "Add a site for each network RyProx can't reach directly, such as a home behind CGNAT. A small connector there dials out to RyProx, so nothing needs to be opened on that network's router.")));
+  };
+  form.addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    clearErrors(form);
+    busy(add, true);
+    try {
+      const r = await api("POST", "/api/sites", { name: name.value });
+      name.value = "";
+      out.replaceChildren(connectorHelp(r.server || "https://<your sign-in domain>", r.token));
+      load();
+    } catch (e) { showError(form, e); }
+    finally { busy(add, false); }
+  });
+  shell("sites",
+    h("div", { class: "page-head" }, h("div", {}, h("h1", {}, "Sites"),
+      h("p", { class: "lede" }, "Networks RyProx reaches through a connector, for services that aren't directly reachable."))),
+    out, form, list);
+  await load();
+  pollTimer = setInterval(load, 10000);
 }
 
 // ---------- import ----------

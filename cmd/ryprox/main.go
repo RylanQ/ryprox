@@ -22,6 +22,7 @@ import (
 	"github.com/rylanq/ryprox/internal/config"
 	"github.com/rylanq/ryprox/internal/server"
 	"github.com/rylanq/ryprox/internal/store"
+	"github.com/rylanq/ryprox/internal/tunnel"
 	"github.com/rylanq/ryprox/internal/version"
 	"github.com/rylanq/ryprox/internal/web"
 )
@@ -51,6 +52,8 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return resetAdmin(args[1:], stdout, stderr)
 	case "healthcheck":
 		return healthcheck()
+	case "connect":
+		return connect(args[1:], stderr)
 	case "help", "--help", "-h":
 		usage(stdout)
 		return nil
@@ -66,6 +69,7 @@ func usage(w io.Writer) {
 Commands:
   serve         Start RyProx
   init          Pre-configure HTTPS and the dashboard domain (used by the installer)
+  connect       Run a site connector: lets RyProx reach services on this network
   reset-admin   Remove the admin account so setup runs again (if you're locked out)
   healthcheck   Exit 0 if RyProx is answering (used by Docker)
   version       Print version information
@@ -94,6 +98,7 @@ func serve(args []string, stdout, stderr io.Writer) error {
 	acmeCA := fs.String("acme-ca", env("RYPROX_ACME_CA", ""), "advanced: PEM file of root certificates for that ACME server (env RYPROX_ACME_CA)")
 	logLevel := fs.String("log-level", env("RYPROX_LOG_LEVEL", "info"), "debug, info, warn or error (env RYPROX_LOG_LEVEL)")
 	logFormat := fs.String("log-format", env("RYPROX_LOG_FORMAT", "text"), "text or json (env RYPROX_LOG_FORMAT)")
+	guacd := fs.String("guacd", env("RYPROX_GUACD", ""), "guacd address for remote desktops, unless set in the dashboard (env RYPROX_GUACD)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -120,6 +125,7 @@ func serve(args []string, stdout, stderr io.Writer) error {
 		AdminAddr:     *adminAddr,
 		ACMEDirectory: *acmeDir,
 		ACMECAFile:    *acmeCA,
+		Guacd:         *guacd,
 		Log:           log,
 		UI:            web.Static(),
 		Ready: func(adminURL, setupCode string) {
@@ -173,6 +179,9 @@ func resetAdmin(args []string, stdout, stderr io.Writer) error {
 
 // healthcheck asks the local admin listener whether RyProx is up.
 func healthcheck() error {
+	if os.Getenv("RYPROX_TOKEN") != "" {
+		return nil // a site connector has no dashboard to check; it reconnects on its own
+	}
 	addr := env("RYPROX_ADMIN", "127.0.0.1:8081")
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -247,4 +256,29 @@ func initCmd(args []string, stdout, stderr io.Writer) error {
 	}
 	_, _ = fmt.Fprintln(stdout)
 	return nil
+}
+
+// connect runs a site connector (tunnel agent).
+func connect(args []string, stderr io.Writer) error {
+	fs := flag.NewFlagSet("connect", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	serverURL := fs.String("server", env("RYPROX_SERVER", ""), "RyProx's sign-in address, e.g. https://login.example.com (env RYPROX_SERVER)")
+	token := fs.String("token", env("RYPROX_TOKEN", ""), "the site's token from the dashboard; prefer the env variable, so it isn't visible in the process list (env RYPROX_TOKEN)")
+	allow := fs.String("allow", env("RYPROX_ALLOW", ""), "comma-separated addresses, ranges (192.168.1.0/24) or host names RyProx may reach here; empty allows any (env RYPROX_ALLOW)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *serverURL == "" || *token == "" {
+		return errors.New("--server and --token (or RYPROX_SERVER and RYPROX_TOKEN) are required")
+	}
+	var list []string
+	if *allow != "" {
+		list = strings.Split(*allow, ",")
+	}
+	log := slog.New(slog.NewTextHandler(stderr, nil))
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	log.Info("starting site connector", "version", version.Version, "server", *serverURL)
+	a := &tunnel.Agent{Server: *serverURL, Token: *token, Allow: list, Log: log}
+	return a.Run(ctx)
 }

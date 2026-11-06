@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -142,6 +143,18 @@ type HealthChecker struct {
 	routes   map[int64][]string // routeID → target URLs, in order
 	log      *slog.Logger
 	wg       sync.WaitGroup
+	dialer   func(map[string]int64) dialFunc
+}
+
+func (hc *HealthChecker) dialFor(target string, site int64) dialFunc {
+	if site == 0 || hc.dialer == nil {
+		return directDialer
+	}
+	u, err := url.Parse(target)
+	if err != nil {
+		return directDialer
+	}
+	return hc.dialer(map[string]int64{hostPort(u): site})
 }
 
 // NewHealthChecker returns an idle checker.
@@ -184,7 +197,7 @@ func (hc *HealthChecker) Sync(routes []store.Route) {
 			}
 			hc.routes[r.ID] = append(hc.routes[r.ID], t.URL)
 			if r.Config.HealthCheck.Enabled {
-				want[k] = fmt.Sprintf("%s|%d|%t", r.Config.HealthCheck.Path, r.Config.HealthCheck.IntervalSeconds, r.Config.TLSSkipVerify)
+				want[k] = fmt.Sprintf("%s|%d|%t|%d", r.Config.HealthCheck.Path, r.Config.HealthCheck.IntervalSeconds, r.Config.TLSSkipVerify, t.Site)
 			}
 		}
 	}
@@ -221,7 +234,7 @@ func (hc *HealthChecker) Sync(routes []store.Route) {
 			ctx, cancel := context.WithCancel(context.Background())
 			hc.checkers[k] = &checker{cancel: cancel, spec: want[k]}
 			hc.wg.Add(1)
-			go hc.run(ctx, h, t.URL, r.Config.HealthCheck, r.Config.TLSSkipVerify)
+			go hc.run(ctx, h, t.URL, r.Config.HealthCheck, r.Config.TLSSkipVerify, hc.dialFor(t.URL, t.Site))
 		}
 	}
 }
@@ -235,10 +248,10 @@ func contains(list []string, s string) bool {
 	return false
 }
 
-func (hc *HealthChecker) run(ctx context.Context, h *TargetHealth, target string, cfg store.HealthCheck, skipVerify bool) {
+func (hc *HealthChecker) run(ctx context.Context, h *TargetHealth, target string, cfg store.HealthCheck, skipVerify bool, dial dialFunc) {
 	defer hc.wg.Done()
 	client := &http.Client{
-		Transport: newTransport(skipVerify),
+		Transport: newTransport(skipVerify, dial),
 		Timeout:   5 * time.Second,
 		// Don't follow redirects: a redirect still means the service is up.
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
@@ -308,9 +321,9 @@ func (hc *HealthChecker) Close() {
 }
 
 // TestTarget makes one request to a target, for the UI's "Test" button.
-func TestTarget(ctx context.Context, target string, skipVerify bool) TargetStatus {
+func (e *Engine) TestTarget(ctx context.Context, target string, skipVerify bool, site int64) TargetStatus {
 	client := &http.Client{
-		Transport:     newTransport(skipVerify),
+		Transport:     newTransport(skipVerify, e.health.dialFor(target, site)),
 		Timeout:       5 * time.Second,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}

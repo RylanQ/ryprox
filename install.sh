@@ -18,6 +18,8 @@
 #   --dashboard-domain NAME also serve the dashboard at https://NAME (default: local only)
 #   --email ADDRESS         email for Let's Encrypt (turns on automatic HTTPS)
 #   --staging | --no-staging  start with test certificates (default: yes)
+#   --remote-desktop | --no-remote-desktop
+#                           also install guacd, for Windows (RDP) and Mac (VNC) desktops in the browser
 #   --version vX.Y.Z        install a specific version (default: newest)
 #   --yes                   don't ask, use the answers given and the defaults
 #   --dry-run               show what would be done, change nothing
@@ -33,7 +35,10 @@ CONTAINER=ryprox
 VOLUME=ryprox-data
 ADMIN_PORT=8081
 
-METHOD="" DOMAIN="" DASHBOARD="" EMAIL="" STAGING="" VERSION="" YES=0 DRY=0
+METHOD="" DOMAIN="" DASHBOARD="" EMAIL="" STAGING="" DESKTOP="" VERSION="" YES=0 DRY=0
+GUACD_IMAGE="guacamole/guacd:1.6.0"
+GUACD_CONTAINER=ryprox-guacd
+NETWORK=ryprox-net
 
 # ---------- output ----------
 if [ -t 1 ]; then
@@ -94,6 +99,8 @@ while [ $# -gt 0 ]; do
     --email) EMAIL=${2:?--email needs a value}; shift ;;
     --staging) STAGING=yes ;;
     --no-staging) STAGING=no ;;
+    --remote-desktop) DESKTOP=yes ;;
+    --no-remote-desktop) DESKTOP=no ;;
     --version) VERSION=${2:?--version needs a value}; shift ;;
     --yes|-y) YES=1 ;;
     --dry-run) DRY=1 ;;
@@ -209,6 +216,12 @@ if [ -z "$EXISTING" ]; then
     if confirm "  Start with test certificates?" y; then STAGING=yes; else STAGING=no; fi
   fi
 
+  if [ -z "$DESKTOP" ]; then
+    say "  RyProx can open Windows (RDP) and Mac (VNC) desktops in the browser. That needs"
+    say "  guacd, Apache Guacamole's connection service. Terminals (SSH) work without it."
+    if confirm "  Install guacd for remote desktops?" n; then DESKTOP=yes; else DESKTOP=no; fi
+  fi
+
   # Ports 80 and 443 must be free.
   step "Checking this server"
   if command -v ss >/dev/null; then
@@ -252,6 +265,7 @@ if [ -z "$EXISTING" ]; then
   say "  Method:     $([ "$METHOD" = docker ] && echo Docker || echo 'system service')"
   say "  Sign-in:    $([ -n "$DOMAIN" ] && echo "https://$DOMAIN" || echo 'set up later in Settings')"
   say "  Dashboard:  $([ -n "$DASHBOARD" ] && echo "https://$DASHBOARD" || echo 'this server only (SSH tunnel)')"
+  say "  Desktops:   $([ "$DESKTOP" = yes ] && echo 'yes (guacd)' || echo 'no (add later with --remote-desktop)')"
   say "  HTTPS:      $([ -n "$EMAIL" ] && { [ "$STAGING" = yes ] && echo "automatic (test certificates)" || echo automatic; } || echo 'off for now (turn on in Settings)')"
   confirm "  Install now?" y || die "cancelled; nothing was changed."
 fi
@@ -278,6 +292,20 @@ install_docker() {
     ok "Built $img"
   fi
 
+  # Keep remote desktops on an update if they were set up before.
+  if [ -z "$DESKTOP" ] && docker container inspect "$GUACD_CONTAINER" >/dev/null 2>&1; then DESKTOP=yes; fi
+  local net_args=()
+  if [ "$DESKTOP" = yes ]; then
+    docker network inspect "$NETWORK" >/dev/null 2>&1 || run docker network create "$NETWORK" >/dev/null
+    run docker pull "$GUACD_IMAGE" >/dev/null
+    if docker container inspect "$GUACD_CONTAINER" >/dev/null 2>&1; then run docker rm -f "$GUACD_CONTAINER" >/dev/null; fi
+    # No published ports: only RyProx, on the private network, can reach it.
+    run docker run -d --name "$GUACD_CONTAINER" --restart unless-stopped --network "$NETWORK" \
+      --cap-drop ALL --security-opt no-new-privileges:true "$GUACD_IMAGE" >/dev/null
+    ok "guacd started for remote desktops"
+    net_args=(--network "$NETWORK" -e "RYPROX_GUACD=$GUACD_CONTAINER:4822")
+  fi
+
   run docker volume create "$VOLUME" >/dev/null
   if [ -z "$EXISTING" ] && [ ${#INIT_ARGS[@]} -gt 0 ]; then
     run docker run --rm -v "$VOLUME:/data" "$img" init --data /data "${INIT_ARGS[@]}"
@@ -288,7 +316,7 @@ install_docker() {
   fi
   run docker run -d --name "$CONTAINER" --restart unless-stopped \
     -p 80:80 -p 443:443 -p "127.0.0.1:$ADMIN_PORT:8081" \
-    -v "$VOLUME:/data" \
+    -v "$VOLUME:/data" --tmpfs /tmp:size=128m "${net_args[@]}" \
     --read-only --cap-drop ALL --security-opt no-new-privileges:true \
     "$img" >/dev/null
   ok "RyProx container started"
@@ -369,6 +397,14 @@ LimitNOFILE=65536
 [Install]
 WantedBy=multi-user.target
 EOF
+  fi
+  if [ "$DESKTOP" = yes ]; then
+    if command -v apt-get >/dev/null; then
+      run apt-get install -y guacd >/dev/null && ok "Installed guacd for remote desktops"
+      say "  Make sure guacd only listens on 127.0.0.1 (its default port is 4822)."
+    else
+      warn "Install guacd with your package manager for remote desktops; RyProx expects it at 127.0.0.1:4822."
+    fi
   fi
   run systemctl daemon-reload
   run systemctl enable --now ryprox >/dev/null 2>&1

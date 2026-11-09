@@ -202,9 +202,20 @@ func (s *Service) runGuac(ctx context.Context, c *websocket.Conn, route *store.R
 	args, err := readInstruction(br)
 	if err != nil || len(args) == 0 || args[0] != "args" {
 		closeWith(c, "Remote desktop service didn't answer")
-		return fmt.Errorf("guacd handshake: %v %v", args, err)
+		if err == nil {
+			err = errors.New("unexpected reply")
+		}
+		return fmt.Errorf("guacd handshake %v: %w", args, err)
 	}
 	params := s.guacParams(route, t, password)
+	if site := route.Config.Console.Site; site != 0 {
+		h, p, err := s.startRelay(ctx, site, route.Config.Console.Address, addr)
+		if err != nil {
+			closeWith(c, "Couldn't reach the site")
+			return errors.Join(errNoRelay, err)
+		}
+		params["hostname"], params["port"] = h, p
+	}
 	values := []string{"connect"}
 	for i, name := range args[1:] {
 		if i == 0 && strings.HasPrefix(name, "VERSION_") {
@@ -224,7 +235,10 @@ func (s *Service) runGuac(ctx context.Context, c *websocket.Conn, route *store.R
 	ready, err := readInstruction(br)
 	if err != nil || len(ready) < 2 || ready[0] != "ready" {
 		closeWith(c, "Couldn't start the remote desktop")
-		return fmt.Errorf("guacd ready: %v %v", ready, err)
+		if err == nil {
+			err = errors.New("unexpected reply")
+		}
+		return fmt.Errorf("guacd ready %v: %w", ready, err)
 	}
 	_ = conn.SetDeadline(time.Time{})
 

@@ -119,7 +119,7 @@ const TokenPrefix = "ryp_"
 
 // TokenHeader carries an access token for scripts and API clients. It is
 // removed before the request reaches the backend.
-const TokenHeader = "X-Ryprox-Token"
+const TokenHeader = "X-Ryprox-Token" //nolint:gosec // a header name, not a credential
 
 // takeToken removes a RyProx access token from the request and returns it.
 // Tokens come in TokenHeader, or as "Authorization: Bearer ryp_…" (only

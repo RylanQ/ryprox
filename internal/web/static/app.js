@@ -700,7 +700,7 @@ async function routeEditor(id) {
   const consoleSection = h("section", { class: "section" },
     h("header", {}, h("h2", {}, "Machine"), h("p", {}, "The computer to open. People get a sign-in page, then the terminal or desktop, all in the browser.")),
     field("Address", cAddr, "Its address on your network, optionally with a port (default 22 for SSH, 3389 for RDP, 5900 for VNC)."),
-    cSite ? field("Reached", cSite, "Terminals can go through a site connector. Remote desktops need a direct connection for now.") : null,
+    cSite ? field("Reached", cSite, "Directly, or through a site connector for machines on another network.") : null,
     field("Username", cUser), field("Sign-in", cAuth), passWrap, sshOnly, rdpOnly);
   const syncConsole = () => {
     const kind = kindOf();

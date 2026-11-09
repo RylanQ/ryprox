@@ -90,7 +90,7 @@ func (s *Server) handlePutCrowdSec(w http.ResponseWriter, r *http.Request, u *st
 			return
 		}
 	}
-	b, _ := json.Marshal(saved)
+	b, _ := json.Marshal(saved) //nolint:gosec // the API key is sealed above before saving
 	if err := s.Store.SetJSONSetting(r.Context(), crowdsecKey, string(b)); err != nil {
 		s.writeErr(w, err)
 		return

@@ -53,7 +53,7 @@ func (s *Store) CreateToken(ctx context.Context, t *Token) error {
 	return err
 }
 
-const tokenCols = "id, user_id, name, token_hash, scope, created_at, expires_at, last_used_at"
+const tokenCols = "id, user_id, name, token_hash, scope, created_at, expires_at, last_used_at" //nolint:gosec // column names, not a credential
 
 func scanToken(row interface{ Scan(...any) error }) (*Token, error) {
 	var t Token

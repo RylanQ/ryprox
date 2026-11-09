@@ -43,6 +43,9 @@ type Service struct {
 	Box   *secrets.Box
 	Log   *slog.Logger
 	UI    fs.FS // the web/static directory
+	// RelayHost is how guacd reaches RyProx, for remote desktops on a site
+	// (default 127.0.0.1; the container name with Docker).
+	RelayHost string
 	// DefaultGuacd is used when no guacd address is saved (e.g. guacd:4822 in Docker).
 	DefaultGuacd string
 	// Dial reaches a machine, through a site's tunnel when site != 0.

@@ -303,7 +303,7 @@ install_docker() {
     run docker run -d --name "$GUACD_CONTAINER" --restart unless-stopped --network "$NETWORK" \
       --cap-drop ALL --security-opt no-new-privileges:true "$GUACD_IMAGE" >/dev/null
     ok "guacd started for remote desktops"
-    net_args=(--network "$NETWORK" -e "RYPROX_GUACD=$GUACD_CONTAINER:4822")
+    net_args=(--network "$NETWORK" -e "RYPROX_GUACD=$GUACD_CONTAINER:4822" -e "RYPROX_FORWARD_HOST=$CONTAINER")
   fi
 
   run docker volume create "$VOLUME" >/dev/null

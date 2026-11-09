@@ -127,8 +127,11 @@ func consoleTicket(t *testing.T, ts *httptest.Server, host, token string, body m
 func dialConsole(t *testing.T, ts *httptest.Server, host, token, ticket string, proto []string) (*websocket.Conn, error) {
 	h := http.Header{}
 	h.Set("X-RyProx-Token", token)
-	c, _, err := websocket.Dial(t.Context(), "wss://"+host+"/ws?ticket="+ticket,
+	c, resp, err := websocket.Dial(t.Context(), "wss://"+host+"/ws?ticket="+ticket,
 		&websocket.DialOptions{HTTPClient: consoleClient(ts), HTTPHeader: h, Subprotocols: proto})
+	if resp != nil && resp.Body != nil {
+		_ = resp.Body.Close()
+	}
 	return c, err
 }
 

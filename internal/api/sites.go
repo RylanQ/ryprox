@@ -181,9 +181,6 @@ func (s *Server) checkSites(r *http.Request, rt *store.Route) error {
 		}
 	}
 	if k := rt.Config.Console; rt.Config.IsConsole() && k.Site != 0 {
-		if rt.Config.Kind != store.KindSSH {
-			return &config.FieldError{Field: "console.site", Message: "remote desktops through a site connector aren't supported yet; use a terminal, or reach the PC directly"}
-		}
 		ids[k.Site] = "console.site"
 	}
 	for id, field := range ids {

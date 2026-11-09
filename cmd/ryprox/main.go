@@ -99,6 +99,7 @@ func serve(args []string, stdout, stderr io.Writer) error {
 	logLevel := fs.String("log-level", env("RYPROX_LOG_LEVEL", "info"), "debug, info, warn or error (env RYPROX_LOG_LEVEL)")
 	logFormat := fs.String("log-format", env("RYPROX_LOG_FORMAT", "text"), "text or json (env RYPROX_LOG_FORMAT)")
 	guacd := fs.String("guacd", env("RYPROX_GUACD", ""), "guacd address for remote desktops, unless set in the dashboard (env RYPROX_GUACD)")
+	relayHost := fs.String("relay-host", env("RYPROX_FORWARD_HOST", ""), "how guacd reaches RyProx for remote desktops on a site: 127.0.0.1, or the container name with Docker (env RYPROX_FORWARD_HOST)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -126,6 +127,7 @@ func serve(args []string, stdout, stderr io.Writer) error {
 		ACMEDirectory: *acmeDir,
 		ACMECAFile:    *acmeCA,
 		Guacd:         *guacd,
+		RelayHost:     *relayHost,
 		Log:           log,
 		UI:            web.Static(),
 		Ready: func(adminURL, setupCode string) {

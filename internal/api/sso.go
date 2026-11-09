@@ -36,7 +36,7 @@ import (
 
 const (
 	ssoSettingKey = "sso_providers"
-	ssoSecretPurp = "sso-client-secret"
+	ssoSecretPurp = "sso-client-secret" //nolint:gosec // a sealing purpose label, not a credential
 	ssoStateTTL   = 10 * time.Minute
 	ssoCookie     = "__Host-ryprox-sso"
 )
@@ -167,7 +167,7 @@ func (s *Server) handlePutSSO(w http.ResponseWriter, r *http.Request, u *store.U
 		}
 		p.HasSecret = false
 	}
-	b, err := json.Marshal(in.Providers)
+	b, err := json.Marshal(in.Providers) //nolint:gosec // client secrets are sealed above before saving
 	if err != nil {
 		s.writeErr(w, err)
 		return
@@ -320,7 +320,7 @@ func (s *Server) handleSSOCallback(w http.ResponseWriter, r *http.Request) {
 	delete(s.ssoStates, key)
 	s.mu.Unlock()
 	ck, _ := r.Cookie(ssoCookie)
-	http.SetCookie(w, &http.Cookie{Name: ssoCookie, Value: "", Path: "/", Secure: true, HttpOnly: true, MaxAge: -1})
+	http.SetCookie(w, &http.Cookie{Name: ssoCookie, Value: "", Path: "/", Secure: true, HttpOnly: true, SameSite: http.SameSiteLaxMode, MaxAge: -1})
 	if !found || time.Now().After(st.expires) || st.realm != rl || st.ip != clientIP(r) || ck == nil ||
 		subtle.ConstantTimeCompare([]byte(hashHex(ck.Value)), []byte(st.cookie)) != 1 {
 		fail("This sign-in link expired or was opened in a different browser. Please start again.")

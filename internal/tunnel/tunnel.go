@@ -273,6 +273,9 @@ func (a *Agent) once(ctx context.Context, allow *allowList) error {
 	h := http.Header{}
 	h.Set("Authorization", "Bearer "+a.Token)
 	c, resp, err := websocket.Dial(ctx, u, &websocket.DialOptions{HTTPHeader: h, HTTPClient: a.HTTPClient, Subprotocols: []string{"ryprox-tunnel"}})
+	if resp != nil && resp.Body != nil {
+		_ = resp.Body.Close()
+	}
 	if err != nil {
 		if resp != nil && resp.StatusCode == http.StatusUnauthorized {
 			return errors.New("the token was refused; create a new one in the dashboard")

@@ -37,6 +37,7 @@ type Options struct {
 	ACMEDirectory string
 	ACMECAFile    string
 	Guacd         string // default guacd address (the dashboard setting wins)
+	RelayHost     string // how guacd reaches RyProx, for desktops on a site
 	Log           *slog.Logger
 	UI            fs.FS
 	// Ready, if set, is called once all listeners are open.
@@ -81,7 +82,7 @@ func Run(ctx context.Context, o Options) error {
 	}, log)
 	adm.Certs = cm
 	engine.SetGate(adm) // private routes check every request against the access lists
-	adm.Console = &console.Service{Store: st, Box: box, Log: log, UI: o.UI, DefaultGuacd: o.Guacd,
+	adm.Console = &console.Service{Store: st, Box: box, Log: log, UI: o.UI, DefaultGuacd: o.Guacd, RelayHost: o.RelayHost,
 		Audit: func(r *http.Request, actor, action, detail string) { adm.Audit(r, actor, action, detail) }}
 	engine.SetConsole(adm.Console)
 	hub := tunnel.NewHub(log)

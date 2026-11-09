@@ -10,6 +10,7 @@ import (
 	"net/mail"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/rylanq/ryprox/internal/store"
 )
@@ -91,8 +92,8 @@ func NormalizeTargetURL(field, raw string) (string, error) {
 		return "", fieldErr(field, "addresses with usernames or passwords are not allowed; use a header rule instead")
 	case u.RawQuery != "" || u.Fragment != "":
 		return "", fieldErr(field, "address can't contain ? or #")
-	case u.Path != "" && u.Path != "/":
-		return "", fieldErr(field, "sub-paths on the backend aren't supported yet; use just the host and port")
+	case u.RawPath != "" || strings.ContainsAny(u.Path, " \\") || strings.Contains(u.Path, "/../") || strings.HasSuffix(u.Path, "/.."):
+		return "", fieldErr(field, "the path in this address isn't valid")
 	}
 	if p := u.Port(); p != "" {
 		var n int
@@ -100,7 +101,7 @@ func NormalizeTargetURL(field, raw string) (string, error) {
 			return "", fieldErr(field, "port must be between 1 and 65535")
 		}
 	}
-	u.Path = ""
+	u.Path = strings.TrimSuffix(u.Path, "/") // a base path like /app; requests are added after it
 	u.Scheme = strings.ToLower(u.Scheme)
 	u.Host = strings.ToLower(u.Host)
 	return u.String(), nil
@@ -165,23 +166,30 @@ func NormalizeRoute(r *store.Route) error {
 	r.Hostname = h
 
 	c := &r.Config
-	if len(c.Targets) == 0 {
-		return fieldErr("targets", "add at least one target")
+	switch c.Kind {
+	case "", store.KindProxy:
+		c.Kind = store.KindProxy
+	case store.KindRedirect, store.KindSSH, store.KindRDP, store.KindVNC:
+	default:
+		return fieldErr("kind", "choose what this route does")
 	}
-	if len(c.Targets) > MaxTargets {
-		return fieldErr("targets", "at most %d targets", MaxTargets)
+	if c.ExpiresAt != nil {
+		t := c.ExpiresAt.UTC().Truncate(time.Second)
+		c.ExpiresAt = &t
 	}
-	seen := map[string]bool{}
-	for i := range c.Targets {
-		u, err := NormalizeTargetURL(fmt.Sprintf("targets.%d", i), c.Targets[i].URL)
-		if err != nil {
-			return err
-		}
-		if seen[u] {
-			return fieldErr(fmt.Sprintf("targets.%d", i), "this target is listed twice")
-		}
-		seen[u] = true
-		c.Targets[i].URL = u
+	if c.RateLimit.RequestsPerMinute < 0 || c.RateLimit.RequestsPerMinute > 1_000_000 {
+		return fieldErr("rateLimit.requestsPerMinute", "enter a number between 0 (no limit) and 1000000")
+	}
+	switch {
+	case c.IsRedirect():
+		err = normalizeRedirect(r)
+	case c.IsConsole():
+		err = normalizeConsole(c)
+	default:
+		err = normalizeProxy(c)
+	}
+	if err != nil {
+		return err
 	}
 	switch c.LoadBalancing {
 	case "":
@@ -230,6 +238,184 @@ func NormalizeRoute(r *store.Route) error {
 	}
 	if hc.IntervalSeconds < 5 || hc.IntervalSeconds > 3600 {
 		return fieldErr("healthCheck.intervalSeconds", "interval must be between 5 and 3600 seconds")
+	}
+	return nil
+}
+
+func normalizeProxy(c *store.RouteConfig) error {
+	var err error
+	c.Redirect = store.Redirect{}
+	if c.Targets, err = normalizeTargets("targets", c.Targets); err != nil {
+		return err
+	}
+	if c.LandingPath != "" {
+		if !validPath(c.LandingPath) || c.LandingPath == "/" {
+			return fieldErr("landingPath", "enter a path on this site, like /page1")
+		}
+	}
+	if len(c.Paths) > MaxPathRules {
+		return fieldErr("paths", "at most %d path rules", MaxPathRules)
+	}
+	prefixes := map[string]bool{}
+	for i := range c.Paths {
+		p := &c.Paths[i]
+		f := fmt.Sprintf("paths.%d", i)
+		p.Prefix = strings.TrimSpace(p.Prefix)
+		if p.Prefix != "/" {
+			p.Prefix = strings.TrimSuffix(p.Prefix, "/")
+		}
+		if !validPath(p.Prefix) || strings.ContainsAny(p.Prefix, "?") || p.Prefix == "/" {
+			return fieldErr(f+".prefix", "enter a path like /api")
+		}
+		if strings.HasPrefix(p.Prefix+"/", "/.ryprox/") {
+			return fieldErr(f+".prefix", "/.ryprox is reserved for RyProx")
+		}
+		if prefixes[p.Prefix] {
+			return fieldErr(f+".prefix", "this path is listed twice")
+		}
+		prefixes[p.Prefix] = true
+		if p.Targets, err = normalizeTargets(f+".targets", p.Targets); err != nil {
+			return err
+		}
+	}
+	if c.Paths == nil {
+		c.Paths = []store.PathRule{}
+	}
+	return nil
+}
+
+var defaultConsolePorts = map[string]string{store.KindSSH: "22", store.KindRDP: "3389", store.KindVNC: "5900"}
+
+func normalizeConsole(c *store.RouteConfig) error {
+	c.Targets, c.Paths, c.LandingPath, c.Redirect = []store.Target{}, []store.PathRule{}, "", store.Redirect{}
+	c.HealthCheck.Enabled = false
+	c.Websockets = true
+	if c.Access.Mode == store.AccessPublic {
+		return fieldErr("access.mode", "terminals and remote desktops are always private")
+	}
+	k := &c.Console
+	k.Address = strings.TrimSpace(k.Address)
+	host, port, err := net.SplitHostPort(k.Address)
+	if err != nil {
+		host, port = k.Address, defaultConsolePorts[c.Kind]
+	}
+	if host == "" || strings.ContainsAny(host, "/ @?#") || len(host) > 253 {
+		return fieldErr("console.address", "enter the machine's address, like 192.168.1.20 or nas.lan:2222")
+	}
+	var n int
+	if _, err := fmt.Sscanf(port, "%d", &n); err != nil || n < 1 || n > 65535 || fmt.Sprint(n) != port {
+		return fieldErr("console.address", "port must be between 1 and 65535")
+	}
+	k.Address = net.JoinHostPort(strings.Trim(host, "[]"), port)
+	k.Username = strings.TrimSpace(k.Username)
+	if len(k.Username) > 100 || strings.ContainsAny(k.Username, "\r\n\x00") {
+		return fieldErr("console.username", "that username isn't valid")
+	}
+	switch c.Kind {
+	case store.KindSSH:
+		if k.Auth == "" {
+			k.Auth = store.ConsoleAuthKey
+		}
+		if k.Auth != store.ConsoleAuthKey && k.Auth != store.ConsoleAuthAsk {
+			return fieldErr("console.auth", "choose RyProx's key or a password")
+		}
+		k.Password, k.Domain, k.Security, k.IgnoreCert = "", "", "", false
+		k.HostKey = strings.TrimSpace(k.HostKey)
+		if k.HostKey != "" && (!strings.HasPrefix(k.HostKey, "SHA256:") || len(k.HostKey) > 80 || strings.ContainsAny(k.HostKey, " \r\n")) {
+			return fieldErr("console.hostKey", "enter the fingerprint as shown by ssh-keygen -lf, starting with SHA256:")
+		}
+	default:
+		if k.Auth == "" {
+			k.Auth = store.ConsoleAuthAsk
+		}
+		if k.Auth != store.ConsoleAuthAsk && k.Auth != store.ConsoleAuthStored {
+			return fieldErr("console.auth", "choose to ask for the password or save it")
+		}
+		k.HostKey = ""
+		if c.Kind == store.KindVNC {
+			k.Domain, k.Security, k.IgnoreCert = "", "", false
+		} else {
+			switch k.Security {
+			case "":
+				k.Security = "any"
+			case "any", "nla", "tls", "rdp":
+			default:
+				return fieldErr("console.security", "choose a security mode")
+			}
+			if len(k.Domain) > 100 || strings.ContainsAny(k.Domain, "\r\n\x00") {
+				return fieldErr("console.domain", "that domain isn't valid")
+			}
+		}
+	}
+	return nil
+}
+
+// MaxPathRules is the most path rules a route may have.
+const MaxPathRules = 50
+
+func normalizeTargets(field string, ts []store.Target) ([]store.Target, error) {
+	if len(ts) == 0 {
+		return nil, fieldErr(field, "add at least one target")
+	}
+	if len(ts) > MaxTargets {
+		return nil, fieldErr(field, "at most %d targets", MaxTargets)
+	}
+	seen := map[string]bool{}
+	for i := range ts {
+		f := fmt.Sprintf("%s.%d", field, i)
+		u, err := NormalizeTargetURL(f, ts[i].URL)
+		if err != nil {
+			return nil, err
+		}
+		if seen[u] {
+			return nil, fieldErr(f, "this target is listed twice")
+		}
+		seen[u] = true
+		ts[i].URL = u
+	}
+	return ts, nil
+}
+
+// validPath accepts an absolute path on the same site: no scheme, no
+// "//host", no backslashes or control characters, no dot segments.
+func validPath(p string) bool {
+	if !strings.HasPrefix(p, "/") || strings.HasPrefix(p, "//") || len(p) > 1024 {
+		return false
+	}
+	if strings.ContainsAny(p, "\\ #\r\n\t\x00") {
+		return false
+	}
+	path, _, _ := strings.Cut(p, "?")
+	for _, seg := range strings.Split(path, "/") {
+		if seg == "." || seg == ".." {
+			return false
+		}
+	}
+	return true
+}
+
+func normalizeRedirect(r *store.Route) error {
+	c := &r.Config
+	c.Targets, c.Paths, c.LandingPath = []store.Target{}, []store.PathRule{}, ""
+	c.HealthCheck.Enabled = false
+	rd := &c.Redirect
+	rd.To = strings.TrimSpace(rd.To)
+	u, err := url.Parse(rd.To)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil || strings.ContainsAny(rd.To, " \r\n\x00\\") {
+		return fieldErr("redirect.to", "enter the full address to send visitors to, like https://example.com")
+	}
+	if strings.EqualFold(u.Hostname(), r.Hostname) && (u.Path == "" || u.Path == "/") {
+		return fieldErr("redirect.to", "this would send visitors back to the same address")
+	}
+	switch rd.Code {
+	case 0:
+		rd.Code = 301
+	case 301, 302, 307, 308:
+	default:
+		return fieldErr("redirect.code", "choose permanent or temporary")
+	}
+	if rd.KeepPath {
+		rd.To = strings.TrimSuffix(rd.To, "/")
 	}
 	return nil
 }

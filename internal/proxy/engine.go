@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -27,10 +28,64 @@ import (
 
 // Engine routes requests by hostname to backends.
 type Engine struct {
-	snap   atomic.Pointer[snapshot]
-	health *HealthChecker
-	log    *slog.Logger
-	gate   atomic.Pointer[gateBox]
+	snap    atomic.Pointer[snapshot]
+	health  *HealthChecker
+	log     *slog.Logger
+	gate    atomic.Pointer[gateBox]
+	console atomic.Pointer[consoleBox]
+	tunnels atomic.Pointer[dialerBox]
+}
+
+// Dialer connects to an address inside a remote site, through its tunnel.
+type Dialer interface {
+	Dial(ctx context.Context, siteID int64, addr string) (net.Conn, error)
+}
+
+type dialerBox struct{ d Dialer }
+
+// SetTunnels installs the tunnel hub used for targets on remote sites.
+func (e *Engine) SetTunnels(d Dialer) { e.tunnels.Store(&dialerBox{d}) }
+
+type dialFunc func(ctx context.Context, network, addr string) (net.Conn, error)
+
+var directDialer = (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext
+
+// dialerFor returns a dial function that sends addresses listed in sites
+// (host:port → site ID) through that site's tunnel, and everything else directly.
+func (e *Engine) dialerFor(sites map[string]int64) dialFunc {
+	if len(sites) == 0 {
+		return directDialer
+	}
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		site, ok := sites[addr]
+		if !ok {
+			return directDialer(ctx, network, addr)
+		}
+		tb := e.tunnels.Load()
+		if tb == nil || tb.d == nil {
+			return nil, errors.New("tunnels aren't available")
+		}
+		return tb.d.Dial(ctx, site, addr)
+	}
+}
+
+// hostPort returns a URL's host:port, filling in the scheme's default port.
+func hostPort(u *url.URL) string {
+	if u.Port() != "" {
+		return u.Host
+	}
+	if u.Scheme == "https" {
+		return net.JoinHostPort(u.Hostname(), "443")
+	}
+	return net.JoinHostPort(u.Hostname(), "80")
+}
+
+// DialTarget connects to host:port, through a site's tunnel when site != 0.
+func (e *Engine) DialTarget(ctx context.Context, site int64, addr string) (net.Conn, error) {
+	if site == 0 {
+		return directDialer(ctx, "tcp", addr)
+	}
+	return e.dialerFor(map[string]int64{addr: site})(ctx, "tcp", addr)
 }
 
 // PortalPrefix is the path RyProx reserves on private sites for its own
@@ -57,7 +112,51 @@ func init() { recheckInterval.Store(int64(15 * time.Second)) }
 
 type userKey struct{}
 
+type tokenKey struct{}
+
+// TokenPrefix starts every RyProx access token.
+const TokenPrefix = "ryp_"
+
+// TokenHeader carries an access token for scripts and API clients. It is
+// removed before the request reaches the backend.
+const TokenHeader = "X-Ryprox-Token" //nolint:gosec // a header name, not a credential
+
+// takeToken removes a RyProx access token from the request and returns it.
+// Tokens come in TokenHeader, or as "Authorization: Bearer ryp_…" (only
+// RyProx tokens are taken; other Authorization headers are left for the app).
+func takeToken(h http.Header) string {
+	if t := h.Get(TokenHeader); t != "" {
+		h.Del(TokenHeader)
+		return t
+	}
+	if a := h.Get("Authorization"); len(a) > 7 && strings.EqualFold(a[:7], "bearer ") {
+		if t := strings.TrimSpace(a[7:]); strings.HasPrefix(t, TokenPrefix) {
+			h.Del("Authorization")
+			return t
+		}
+	}
+	return ""
+}
+
+// RequestToken returns the access token sent with a request to a private
+// route, if any. For use by the Gate.
+func RequestToken(r *http.Request) string {
+	t, _ := r.Context().Value(tokenKey{}).(string)
+	return t
+}
+
 type gateBox struct{ g Gate }
+
+// Console serves terminal and remote desktop routes, after the gate has
+// let the visitor in.
+type Console interface {
+	ServeConsole(w http.ResponseWriter, r *http.Request, route *store.Route, username string)
+}
+
+type consoleBox struct{ c Console }
+
+// SetConsole installs the console service.
+func (e *Engine) SetConsole(c Console) { e.console.Store(&consoleBox{c}) }
 
 // SetGate installs the access gate. Until one is set, private routes refuse
 // every request (fail closed).
@@ -117,11 +216,21 @@ type snapshot struct {
 
 type liveRoute struct {
 	route     store.Route
-	targets   []*liveTarget
-	next      atomic.Uint64
+	pools     []*pool // path rules, longest prefix first, then the default ("")
 	transport *http.Transport
 	proxy     *httputil.ReverseProxy
+	limiter   *rateLimiter
 }
+
+// pool is a set of targets serving one path prefix ("" = everything else).
+type pool struct {
+	prefix  string
+	strip   bool
+	targets []*liveTarget
+	next    atomic.Uint64
+}
+
+type poolKey struct{}
 
 type liveTarget struct {
 	url    *url.URL
@@ -133,6 +242,7 @@ type ctxKey struct{}
 // NewEngine returns an engine with no routes.
 func NewEngine(log *slog.Logger) *Engine {
 	e := &Engine{log: log, health: NewHealthChecker(log)}
+	e.health.dialer = e.dialerFor
 	e.snap.Store(&snapshot{routes: map[string]*liveRoute{}})
 	return e
 }
@@ -200,19 +310,64 @@ func (e *Engine) build(routes []store.Route) (*snapshot, error) {
 	return s, nil
 }
 
-func (e *Engine) buildRoute(r store.Route) (*liveRoute, error) {
-	if len(r.Config.Targets) == 0 {
+func (e *Engine) buildPool(routeID int64, prefix string, strip bool, targets []store.Target) (*pool, error) {
+	if len(targets) == 0 {
 		return nil, errors.New("no targets")
 	}
-	lr := &liveRoute{route: r}
-	for _, t := range r.Config.Targets {
+	p := &pool{prefix: prefix, strip: strip}
+	for _, t := range targets {
 		u, err := url.Parse(t.URL)
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 			return nil, fmt.Errorf("invalid target %q", t.URL)
 		}
-		lr.targets = append(lr.targets, &liveTarget{url: u, health: e.health.Get(r.ID, t.URL)})
+		p.targets = append(p.targets, &liveTarget{url: u, health: e.health.Get(routeID, t.URL)})
 	}
-	lr.transport = newTransport(r.Config.TLSSkipVerify)
+	return p, nil
+}
+
+func (e *Engine) buildRoute(r store.Route) (*liveRoute, error) {
+	lr := &liveRoute{route: r}
+	if n := r.Config.RateLimit.RequestsPerMinute; n > 0 {
+		lr.limiter = newRateLimiter(n)
+	}
+	if r.Config.IsRedirect() {
+		if _, err := url.Parse(r.Config.Redirect.To); err != nil || r.Config.Redirect.To == "" {
+			return nil, errors.New("invalid redirect address")
+		}
+		lr.transport = newTransport(false, directDialer)
+		return lr, nil
+	}
+	if r.Config.IsConsole() {
+		if r.Config.Access.IsPublic() {
+			return nil, errors.New("consoles must be private")
+		}
+		lr.transport = newTransport(false, directDialer)
+		return lr, nil
+	}
+	rules := append([]store.PathRule(nil), r.Config.Paths...)
+	sort.SliceStable(rules, func(i, j int) bool { return len(rules[i].Prefix) > len(rules[j].Prefix) })
+	for _, pr := range rules {
+		if pr.Prefix == "" || !strings.HasPrefix(pr.Prefix, "/") {
+			return nil, fmt.Errorf("invalid path %q", pr.Prefix)
+		}
+		p, err := e.buildPool(r.ID, pr.Prefix, pr.StripPrefix, pr.Targets)
+		if err != nil {
+			return nil, fmt.Errorf("path %s: %w", pr.Prefix, err)
+		}
+		lr.pools = append(lr.pools, p)
+	}
+	def, err := e.buildPool(r.ID, "", false, r.Config.Targets)
+	if err != nil {
+		return nil, err
+	}
+	lr.pools = append(lr.pools, def)
+	sites := map[string]int64{}
+	for _, t := range r.Config.AllTargets() {
+		if u, err := url.Parse(t.URL); err == nil && t.Site != 0 {
+			sites[hostPort(u)] = t.Site
+		}
+	}
+	lr.transport = newTransport(r.Config.TLSSkipVerify, e.dialerFor(sites))
 	lr.proxy = &httputil.ReverseProxy{
 		Rewrite:        lr.rewrite,
 		Transport:      lr.transport,
@@ -223,13 +378,10 @@ func (e *Engine) buildRoute(r store.Route) (*liveRoute, error) {
 	return lr, nil
 }
 
-func newTransport(skipVerify bool) *http.Transport {
+func newTransport(skipVerify bool, dial dialFunc) *http.Transport {
 	return &http.Transport{
-		Proxy: nil, // never route backend traffic through an environment proxy
-		DialContext: (&net.Dialer{
-			Timeout:   10 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
+		Proxy:                 nil, // never route backend traffic through an environment proxy
+		DialContext:           dial,
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          200,
 		MaxIdleConnsPerHost:   50,
@@ -245,32 +397,59 @@ func newTransport(skipVerify bool) *http.Transport {
 
 // pick chooses a target, skipping ones known to be down. If every target is
 // down it still tries one, in case the health check is wrong.
-func (lr *liveRoute) pick() *liveTarget {
-	n := len(lr.targets)
+func (p *pool) pick(failover bool) *liveTarget {
+	n := len(p.targets)
 	if n == 1 {
-		return lr.targets[0]
+		return p.targets[0]
 	}
-	if lr.route.Config.LoadBalancing == "failover" {
-		for _, t := range lr.targets {
+	if failover {
+		for _, t := range p.targets {
 			if t.health.Usable() {
 				return t
 			}
 		}
-		return lr.targets[0]
+		return p.targets[0]
 	}
-	start := lr.next.Add(1) - 1
+	start := p.next.Add(1) - 1
 	for i := range n {
-		t := lr.targets[(start+uint64(i))%uint64(n)]
+		t := p.targets[(start+uint64(i))%uint64(n)]
 		if t.health.Usable() {
 			return t
 		}
 	}
-	return lr.targets[start%uint64(n)]
+	return p.targets[start%uint64(n)]
+}
+
+// matches reports whether path falls under the pool's prefix: /api matches
+// /api and /api/x, but not /apix.
+func (p *pool) matches(path string) bool {
+	return p.prefix == "" || path == p.prefix || strings.HasPrefix(path, p.prefix+"/")
+}
+
+// poolFor returns the pool for a request path.
+func (lr *liveRoute) poolFor(path string) *pool {
+	for _, p := range lr.pools {
+		if p.matches(path) {
+			return p
+		}
+	}
+	return lr.pools[len(lr.pools)-1]
 }
 
 func (lr *liveRoute) rewrite(pr *httputil.ProxyRequest) {
-	t := lr.pick()
+	p, _ := pr.In.Context().Value(poolKey{}).(*pool)
+	if p == nil {
+		p = lr.poolFor(pr.In.URL.Path)
+	}
+	t := p.pick(lr.route.Config.LoadBalancing == "failover")
 	pr.Out = pr.Out.WithContext(context.WithValue(pr.Out.Context(), ctxKey{}, t))
+	if p.strip && p.prefix != "" {
+		rest := strings.TrimPrefix(pr.Out.URL.Path, p.prefix)
+		if !strings.HasPrefix(rest, "/") {
+			rest = "/" + rest
+		}
+		pr.Out.URL.Path, pr.Out.URL.RawPath = rest, ""
+	}
 	pr.SetURL(t.url)
 
 	// Rewrite has already removed any X-Forwarded-* headers sent by the
@@ -361,8 +540,19 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		WritePage(w, http.StatusNotFound, "Not found", "No site is configured at this address.")
 		return
 	}
+	cfg := &lr.route.Config
+	if cfg.Expired(time.Now()) {
+		WritePage(w, http.StatusGone, "Link expired", "This address was only available for a limited time.")
+		return
+	}
+	if lr.limiter != nil && !lr.limiter.allow(clientKey(r.RemoteAddr)) {
+		w.Header().Set("Retry-After", "60")
+		WritePage(w, http.StatusTooManyRequests, "Slow down", "Too many requests from your address. Please wait a minute and try again.")
+		return
+	}
+	tok := takeToken(r.Header)
 	stripUnsafeHeaders(r.Header)
-	if !lr.route.Config.Access.IsPublic() {
+	if !cfg.Access.IsPublic() {
 		gb := e.gate.Load()
 		if gb == nil || gb.g == nil {
 			WritePage(w, http.StatusServiceUnavailable, "Not available", "This site is private and sign-in isn't available right now.")
@@ -371,6 +561,9 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, PortalPrefix) {
 			gb.g.Portal(w, r, &lr.route)
 			return
+		}
+		if tok != "" {
+			r = r.WithContext(context.WithValue(r.Context(), tokenKey{}, tok))
 		}
 		user, stillAllowed, ok := gb.g.Authorize(w, r, &lr.route)
 		if !ok {
@@ -383,12 +576,47 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		r = r.WithContext(ctx)
 	}
+	if cfg.IsRedirect() {
+		redirect(w, r, cfg.Redirect)
+		return
+	}
+	if cfg.IsConsole() {
+		cb := e.console.Load()
+		user, _ := r.Context().Value(userKey{}).(string)
+		if cb == nil || cb.c == nil || user == "" {
+			WritePage(w, http.StatusServiceUnavailable, "Not available", "Consoles aren't available right now.")
+			return
+		}
+		cb.c.ServeConsole(w, r, &lr.route, user)
+		return
+	}
+	if cfg.LandingPath != "" && r.URL.Path == "/" && r.URL.RawQuery == "" && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
+		http.Redirect(w, r, cfg.LandingPath, http.StatusFound)
+		return
+	}
 	stripRyproxCookies(r.Header)
+	r = r.WithContext(context.WithValue(r.Context(), poolKey{}, lr.poolFor(r.URL.Path)))
 	if isUpgrade(r) && !lr.route.Config.Websockets {
 		WritePage(w, http.StatusForbidden, "Not allowed", "WebSocket connections are turned off for this site.")
 		return
 	}
 	lr.proxy.ServeHTTP(w, r)
+}
+
+// redirect sends the visitor to a redirect route's destination.
+func redirect(w http.ResponseWriter, r *http.Request, rd store.Redirect) {
+	to := rd.To
+	if rd.KeepPath {
+		to += r.URL.EscapedPath()
+		if r.URL.RawQuery != "" {
+			to += "?" + r.URL.RawQuery
+		}
+	}
+	code := rd.Code
+	if code == 0 {
+		code = http.StatusMovedPermanently
+	}
+	http.Redirect(w, r, to, code) //nolint:gosec // destination is admin configuration, not visitor input
 }
 
 // watchAccess cancels a long-lived request once its session stops being

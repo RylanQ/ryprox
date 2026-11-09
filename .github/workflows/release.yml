@@ -2,9 +2,11 @@ name: Release
 
 # Runs when a version tag is pushed, e.g. v0.1.0 or v0.1.0-alpha.1
 # (create one from GitHub: Releases → Draft a new release → choose a tag).
+# Every push to main also publishes ghcr.io/rylanq/ryprox:edge.
 on:
   push:
     tags: ["v*"]
+    branches: [main]
 
 permissions:
   contents: read
@@ -12,6 +14,7 @@ permissions:
 jobs:
   binaries:
     name: Binaries and GitHub release
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
       contents: write # create the release
@@ -78,8 +81,6 @@ jobs:
           platforms: linux/amd64,linux/arm64,linux/arm/v7
           push: true
           build-args: |
-            VERSION=${{ github.ref_name }}
+            VERSION=${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'edge' }}
             COMMIT=${{ github.sha }}
-          tags: |
-            ghcr.io/rylanq/ryprox:${{ github.ref_name }}
-            ghcr.io/rylanq/ryprox:latest
+          tags: ${{ startsWith(github.ref, 'refs/tags/') && format('ghcr.io/rylanq/ryprox:{0},ghcr.io/rylanq/ryprox:latest', github.ref_name) || 'ghcr.io/rylanq/ryprox:edge' }}

@@ -30,6 +30,8 @@ type env struct {
 	ts     *httptest.Server
 	code   string
 	engine *proxy.Engine
+
+	setupSecret string
 }
 
 func newEnv(t *testing.T) *env {
@@ -40,11 +42,11 @@ func newEnv(t *testing.T) *env {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
-	box, _ := secrets.LoadOrCreate(filepath.Join(dir, "key"))
+	box, _ := secrets.LoadOrCreate(filepath.Join(dir, "secret.key"))
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	eng := proxy.NewEngine(log)
 	t.Cleanup(eng.Close)
-	s := &Server{Store: st, Engine: eng, Box: box, Log: log,
+	s := &Server{Store: st, Engine: eng, Box: box, Log: log, DataDir: dir,
 		UI: fstest.MapFS{"index.html": {Data: []byte("<!doctype html><title>RyProx</title>")}}}
 	s.Certs = certs.New(filepath.Join(dir, "certs"), func(string) bool { return false }, log)
 	code, err := New(t.Context(), s)
@@ -59,8 +61,9 @@ func newEnv(t *testing.T) *env {
 
 // client is a browser with its own cookie jar.
 type client struct {
-	e *env
-	c *http.Client
+	e    *env
+	c    *http.Client
+	host string // Host header to send, if not the test server's address
 }
 
 func (e *env) client() *client {
@@ -78,7 +81,14 @@ func (c *client) req(method, path string, body any, hdr map[string]string) (int,
 	req, _ := http.NewRequestWithContext(c.e.t.Context(), method, c.e.ts.URL+path, r)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-RyProx", "1")
+	if c.host != "" {
+		req.Host = c.host
+	}
 	for k, v := range hdr {
+		if k == "Host" {
+			req.Host = v
+			continue
+		}
 		if v == "" {
 			req.Header.Del(k)
 		} else {
@@ -128,6 +138,7 @@ func (e *env) setup(c *client) string {
 	if n := len(out["recoveryCodes"].([]any)); n != 10 {
 		e.t.Fatalf("%d recovery codes", n)
 	}
+	e.setupSecret = secret
 	return secret
 }
 

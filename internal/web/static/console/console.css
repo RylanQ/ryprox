@@ -1,0 +1,23 @@
+:root { --bg: #0f1419; --panel: #1a2129; --line: #2a333d; --ink: #e6e9ed; --muted: #8b96a3; --accent: #2f8f83; --bad: #e0675d; }
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: var(--bg); color: var(--ink); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+body { display: flex; flex-direction: column; }
+.bar { display: flex; align-items: center; gap: .75rem; padding: .4rem .9rem; background: var(--panel); border-bottom: 1px solid var(--line); font-size: .85rem; }
+.brand { font-weight: 700; }
+#title { color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.spacer { flex: 1; }
+#status.bad { color: var(--bad); }
+#screen { flex: 1; position: relative; overflow: hidden; }
+.term { position: absolute; inset: 0; padding: 4px; }
+.desk { position: absolute; inset: 0; display: grid; place-items: center; outline: none; }
+.desk > div { cursor: none; }
+.card { max-width: 24rem; margin: 12vh auto; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 1.5rem; }
+.card h1 { font-size: 1.15rem; margin: 0 0 .25rem; }
+.card p { color: var(--muted); margin: 0 0 1rem; }
+label { display: block; margin-bottom: .8rem; }
+label span { display: block; font-size: .85rem; margin-bottom: .25rem; }
+input { width: 100%; padding: .55rem .65rem; border-radius: 6px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); font: inherit; }
+button { padding: .5rem 1rem; border-radius: 6px; border: 1px solid var(--line); background: var(--accent); color: #fff; font: inherit; font-weight: 600; cursor: pointer; }
+button.ghost { background: transparent; color: var(--ink); }
+.err { color: var(--bad); font-size: .9rem; margin: 0 0 .8rem; }
+.overlay { position: absolute; inset: 0; background: rgb(15 20 25 / .85); display: grid; place-items: center; }

@@ -132,6 +132,59 @@ CREATE TABLE invites (
 	expires_at INTEGER NOT NULL
 );
 `,
+	// 3: access tokens, passkeys and single sign-on
+	`
+ALTER TABLE users ADD COLUMN email TEXT NOT NULL DEFAULT '';
+CREATE TABLE tokens (
+	id           INTEGER PRIMARY KEY AUTOINCREMENT,
+	user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+	name         TEXT    NOT NULL,
+	token_hash   BLOB    NOT NULL UNIQUE,
+	scope        TEXT    NOT NULL,
+	created_at   INTEGER NOT NULL,
+	expires_at   INTEGER NOT NULL DEFAULT 0,
+	last_used_at INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE passkeys (
+	id            INTEGER PRIMARY KEY AUTOINCREMENT,
+	user_id       INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+	name          TEXT    NOT NULL,
+	credential_id BLOB    NOT NULL UNIQUE,
+	data          TEXT    NOT NULL,
+	created_at    INTEGER NOT NULL,
+	last_used_at  INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE identities (
+	id         INTEGER PRIMARY KEY AUTOINCREMENT,
+	user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+	provider   TEXT    NOT NULL,
+	subject    TEXT    NOT NULL,
+	email      TEXT    NOT NULL DEFAULT '',
+	created_at INTEGER NOT NULL,
+	UNIQUE (provider, subject)
+);
+`,
+	// 4: remote sites reached through tunnels
+	`
+CREATE TABLE sites (
+	id           INTEGER PRIMARY KEY AUTOINCREMENT,
+	name         TEXT    NOT NULL UNIQUE COLLATE NOCASE,
+	token_hash   BLOB    NOT NULL UNIQUE,
+	created_at   INTEGER NOT NULL,
+	last_seen_at INTEGER NOT NULL DEFAULT 0
+);
+`,
+	// 5: follower servers that mirror this one
+	`
+CREATE TABLE nodes (
+	id           INTEGER PRIMARY KEY AUTOINCREMENT,
+	name         TEXT    NOT NULL UNIQUE COLLATE NOCASE,
+	token_hash   BLOB    NOT NULL UNIQUE,
+	created_at   INTEGER NOT NULL,
+	last_seen_at INTEGER NOT NULL DEFAULT 0,
+	last_ip      TEXT    NOT NULL DEFAULT ''
+);
+`,
 }
 
 func (s *Store) migrate(ctx context.Context) error {

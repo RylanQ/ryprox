@@ -23,9 +23,16 @@ type Route struct {
 // RouteConfig holds everything about a route except its identity.
 // It is stored as JSON so new options can be added without migrations.
 type RouteConfig struct {
+	Kind            string       `json:"kind"` // "proxy" (default) or "redirect"
 	Targets         []Target     `json:"targets"`
-	LoadBalancing   string       `json:"loadBalancing"` // "round_robin" or "failover"
-	TLSSkipVerify   bool         `json:"tlsSkipVerify"` // for backends with self-signed certificates
+	Paths           []PathRule   `json:"paths"`       // send some paths to other targets
+	LandingPath     string       `json:"landingPath"` // where visitors to "/" are sent, e.g. /page1
+	Redirect        Redirect     `json:"redirect"`
+	Console         Console      `json:"console"` // for ssh, rdp and vnc routes
+	RateLimit       RateLimit    `json:"rateLimit"`
+	ExpiresAt       *time.Time   `json:"expiresAt,omitempty"` // temporary routes stop working after this
+	LoadBalancing   string       `json:"loadBalancing"`       // "round_robin" or "failover"
+	TLSSkipVerify   bool         `json:"tlsSkipVerify"`       // for backends with self-signed certificates
 	Websockets      bool         `json:"websockets"`
 	HTTPSRedirect   bool         `json:"httpsRedirect"`
 	PreserveHost    bool         `json:"preserveHost"` // send the visitor's Host header to the backend
@@ -62,9 +69,82 @@ func (a Access) Allows(userID int64) bool {
 	return false
 }
 
+// Route kinds.
+const (
+	KindProxy    = "proxy"
+	KindRedirect = "redirect"
+	KindSSH      = "ssh" // a terminal in the browser
+	KindRDP      = "rdp" // a Windows desktop in the browser (needs guacd)
+	KindVNC      = "vnc" // a Mac or Linux desktop in the browser (needs guacd)
+)
+
+// IsConsole reports whether the route opens a terminal or desktop in the browser.
+func (c RouteConfig) IsConsole() bool {
+	return c.Kind == KindSSH || c.Kind == KindRDP || c.Kind == KindVNC
+}
+
+// Console auth modes.
+const (
+	ConsoleAuthKey    = "key"    // ssh: RyProx's own SSH key
+	ConsoleAuthAsk    = "ask"    // the person types the password when connecting
+	ConsoleAuthStored = "stored" // rdp/vnc: a password saved (encrypted) by an admin
+)
+
+// Console describes the machine a console route connects to.
+type Console struct {
+	Address     string `json:"address"`  // host:port
+	Username    string `json:"username"` // empty: asked when connecting
+	Auth        string `json:"auth"`
+	Password    string `json:"password,omitempty"` // sealed; never sent to the browser
+	HasPassword bool   `json:"hasPassword"`
+	HostKey     string `json:"hostKey"`        // ssh: expected key fingerprint (SHA256:...), learned on first use if empty
+	Domain      string `json:"domain"`         // rdp
+	Security    string `json:"security"`       // rdp: any, nla, tls, rdp
+	IgnoreCert  bool   `json:"ignoreCert"`     // rdp: accept a self-signed certificate
+	Site        int64  `json:"site,omitempty"` // ssh: reached through this site's tunnel
+}
+
+// IsRedirect reports whether the route only redirects visitors elsewhere.
+func (c RouteConfig) IsRedirect() bool { return c.Kind == KindRedirect }
+
+// AllTargets returns the default targets followed by every path rule's.
+func (c RouteConfig) AllTargets() []Target {
+	out := append([]Target(nil), c.Targets...)
+	for _, p := range c.Paths {
+		out = append(out, p.Targets...)
+	}
+	return out
+}
+
+// Expired reports whether a temporary route has passed its end time.
+func (c RouteConfig) Expired(now time.Time) bool {
+	return c.ExpiresAt != nil && !now.Before(*c.ExpiresAt)
+}
+
+// PathRule sends requests whose path starts with Prefix to its own targets.
+// The longest matching prefix wins.
+type PathRule struct {
+	Prefix      string   `json:"prefix"` // e.g. /api
+	Targets     []Target `json:"targets"`
+	StripPrefix bool     `json:"stripPrefix"` // /api/users reaches the backend as /users
+}
+
+// Redirect sends every visitor to another address.
+type Redirect struct {
+	To       string `json:"to"`       // e.g. https://example.com
+	Code     int    `json:"code"`     // 301 (permanent) or 302 (temporary)
+	KeepPath bool   `json:"keepPath"` // /a?b=c on this route goes to <To>/a?b=c
+}
+
+// RateLimit caps requests from one address. Zero means no limit.
+type RateLimit struct {
+	RequestsPerMinute int `json:"requestsPerMinute"`
+}
+
 // Target is one backend server, e.g. http://10.0.0.5:8080.
 type Target struct {
-	URL string `json:"url"`
+	URL  string `json:"url"`
+	Site int64  `json:"site,omitempty"` // reached through this site's tunnel (0: directly)
 }
 
 // HeaderRule sets or removes one header.

@@ -344,7 +344,7 @@ func TestHealthChecks(t *testing.T) {
 	_ = e.Apply([]store.Route{r})
 	waitFor(StateDown)
 
-	st := TestTarget(t.Context(), backend.URL+"/health", false)
+	st := e.TestTarget(t.Context(), backend.URL+"/health", false, 0)
 	if st.State != StateDown || st.LastError != "HTTP 503" {
 		t.Fatalf("TestTarget = %+v", st)
 	}
@@ -561,5 +561,128 @@ func TestRevokedAccessClosesWebSocket(t *testing.T) {
 	}
 	if time.Since(start) > 2*time.Second {
 		t.Fatal("connection took too long to close")
+	}
+}
+
+func TestPathRules(t *testing.T) {
+	web, api := echo(t, "web"), echo(t, "api")
+	r := route(1, "a.example.com", web.URL)
+	r.Config.Paths = []store.PathRule{
+		{Prefix: "/api", Targets: []store.Target{{URL: api.URL}}, StripPrefix: true},
+		{Prefix: "/api/v2", Targets: []store.Target{{URL: api.URL + "/two"}}},
+	}
+	e := newEngine(t, r)
+	cases := []struct{ path, name, got string }{
+		{"/", "web", "/"},
+		{"/apix", "web", "/apix"},
+		{"/api", "api", "/"},
+		{"/api/users?x=1", "api", "/users?x=1"},
+		{"/api/v2/z", "api", "/two/api/v2/z"},
+	}
+	for _, c := range cases {
+		body := do(t, e, "a.example.com", c.path, nil).Body.String()
+		if field(body, "name") != c.name || field(body, "path") != c.got {
+			t.Errorf("%s → %s %s, want %s %s", c.path, field(body, "name"), field(body, "path"), c.name, c.got)
+		}
+	}
+}
+
+func TestBackendBasePath(t *testing.T) {
+	a := echo(t, "a")
+	e := newEngine(t, route(1, "a.example.com", a.URL+"/app"))
+	if got := field(do(t, e, "a.example.com", "/x?y=1", nil).Body.String(), "path"); got != "/app/x?y=1" {
+		t.Fatalf("path = %q", got)
+	}
+}
+
+func TestLandingPath(t *testing.T) {
+	a := echo(t, "a")
+	r := route(1, "a.example.com", a.URL)
+	r.Config.LandingPath = "/page1"
+	e := newEngine(t, r)
+	rec := do(t, e, "a.example.com", "/", nil)
+	if rec.Code != http.StatusFound || rec.Header().Get("Location") != "/page1" {
+		t.Fatalf("/ → %d %q", rec.Code, rec.Header().Get("Location"))
+	}
+	if got := field(do(t, e, "a.example.com", "/other", nil).Body.String(), "path"); got != "/other" {
+		t.Fatalf("other path = %q", got)
+	}
+}
+
+func TestRedirectRoute(t *testing.T) {
+	r := store.Route{ID: 1, Hostname: "www.example.com", Enabled: true, Config: store.RouteConfig{Kind: store.KindRedirect,
+		Access: store.Access{Mode: store.AccessPublic}, Redirect: store.Redirect{To: "https://example.com", Code: 301, KeepPath: true}}}
+	e := newEngine(t, r)
+	rec := do(t, e, "www.example.com", "/a/b?c=d", nil)
+	if rec.Code != 301 || rec.Header().Get("Location") != "https://example.com/a/b?c=d" {
+		t.Fatalf("got %d %q", rec.Code, rec.Header().Get("Location"))
+	}
+	// A private redirect still asks who you are first.
+	r.Config.Access.Mode = store.AccessPrivate
+	e = newEngine(t, r)
+	if rec := do(t, e, "www.example.com", "/", nil); rec.Code == 301 {
+		t.Fatal("private redirect served without a gate")
+	}
+}
+
+func TestRateLimit(t *testing.T) {
+	a := echo(t, "a")
+	r := route(1, "a.example.com", a.URL)
+	r.Config.RateLimit.RequestsPerMinute = 3
+	e := newEngine(t, r)
+	for i := range 3 {
+		if rec := do(t, e, "a.example.com", "/", nil); rec.Code != 200 {
+			t.Fatalf("request %d: %d", i, rec.Code)
+		}
+	}
+	if rec := do(t, e, "a.example.com", "/", nil); rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("4th request: %d", rec.Code)
+	}
+}
+
+func TestRateLimiterWindows(t *testing.T) {
+	now := time.Unix(1_000_000_020, 0)
+	l := newRateLimiter(2)
+	l.now = func() time.Time { return now }
+	first, second, third := l.allow("a"), l.allow("a"), l.allow("a")
+	if !first || !second || third {
+		t.Fatal("first minute")
+	}
+	if !l.allow("b") {
+		t.Fatal("other address limited")
+	}
+	now = now.Add(2 * time.Minute)
+	if !l.allow("a") {
+		t.Fatal("not reset after two minutes")
+	}
+	if clientKey("[2001:db8:1:2:3::1]:5") != clientKey("[2001:db8:1:2:ffff::9]:6") {
+		t.Fatal("IPv6 /64 not grouped")
+	}
+}
+
+func TestExpiredRoute(t *testing.T) {
+	a := echo(t, "a")
+	r := route(1, "a.example.com", a.URL)
+	past := time.Now().Add(-time.Minute)
+	r.Config.ExpiresAt = &past
+	e := newEngine(t, r)
+	if rec := do(t, e, "a.example.com", "/", nil); rec.Code != http.StatusGone {
+		t.Fatalf("expired route: %d", rec.Code)
+	}
+}
+
+func TestUptimeHistory(t *testing.T) {
+	h := &TargetHealth{state: StateUnknown}
+	now := time.Unix(1_000_000_000, 0)
+	h.record(StateUp, now)
+	h.record(StateUp, now)
+	h.record(StateDown, now)
+	h.record(StateUp, now.Add(-time.Hour))
+	hist, up := h.history(now)
+	if len(hist) != historyHours || hist[historyHours-1] < 0.66 || hist[historyHours-1] > 0.67 || hist[historyHours-2] != 1 || hist[0] != -1 {
+		t.Fatalf("history %v", hist)
+	}
+	if up != 0.75 {
+		t.Fatalf("uptime %v", up)
 	}
 }

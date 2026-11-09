@@ -174,6 +174,7 @@ async function boot() {
     state.setupRequired = s.setupRequired;
     state.user = s.user || null;
     state.insecure = s.insecure;
+    state.follower = s.follower || null;
     state.version = s.version;
   } catch (e) {
     mount(h("main", {}, h("div", { class: "banner error" }, e.message)));
@@ -194,6 +195,8 @@ function render() {
   if (path === "/people") return peoplePage();
   if (path === "/settings") return settingsPage();
   if (path === "/activity") return activityPage();
+  if (path === "/import") return importPage();
+  if (path === "/sites") return sitesPage();
   return routesPage();
 }
 
@@ -203,6 +206,9 @@ function shell(current, ...content) {
     state.insecure ? h("div", { class: "banner", role: "note" },
       "You're using the dashboard over an unencrypted connection from another computer. " +
       "Use an SSH tunnel, or set an admin domain under Settings so your password is protected.") : null,
+    state.follower ? h("div", { class: "banner", role: "note" },
+      h("b", {}, "This server mirrors "), h("span", { class: "mono" }, state.follower.primary), ". Changes are made there and copied here every few seconds.",
+      state.follower.error ? h("div", { class: "err" }, "Last sync failed: " + state.follower.error) : null) : null,
     ...content);
   mount(h("div", { class: "shell" },
     h("aside", { class: "side" },
@@ -210,6 +216,7 @@ function shell(current, ...content) {
       h("nav", { class: "nav", "aria-label": "Main" },
         link("#/", "Routes", "routes"),
         link("#/people", "People", "people"),
+        link("#/sites", "Sites", "sites"),
         link("#/certificates", "Certificates", "certs"),
         link("#/activity", "Activity", "activity"),
         link("#/settings", "Settings", "settings")),
@@ -259,7 +266,24 @@ function loginPage() {
       showError(form, e);
     }
   });
-  authLayout(h("h1", {}, "Sign in"), h("p", { class: "lede" }, "Manage your routes and certificates."), form);
+  const pkBtn = window.RyPasskey?.supported() ? h("button", { class: "btn", type: "button" }, "Sign in with a passkey") : null;
+  pkBtn?.addEventListener("click", async () => {
+    clearErrors(form);
+    busy(pkBtn, true, "Waiting for your device…");
+    try {
+      const b = await api("POST", "/api/login/passkey/begin", {});
+      const cred = await window.RyPasskey.get(b.options);
+      await api("POST", `/api/login/passkey/finish?id=${encodeURIComponent(b.id)}`, cred);
+      const st = await api("GET", "/api/state");
+      state.user = st.user;
+      go("#/");
+    } catch (e) {
+      busy(pkBtn, false);
+      showError(form, e instanceof ApiError ? e : { message: window.RyPasskey.message(e) });
+    }
+  });
+  authLayout(h("h1", {}, "Sign in"), h("p", { class: "lede" }, "Manage your routes and certificates."), form,
+    pkBtn ? h("div", { class: "or" }, h("span", {}, "or")) : null, pkBtn);
   user.focus();
 }
 
@@ -420,7 +444,7 @@ async function routesPage() {
   const main = shell("routes",
     h("div", { class: "page-head" },
       h("div", {}, h("h1", {}, "Routes"), h("p", { class: "lede" }, "Each route connects a domain to the services behind it. Changes go live as soon as you save.")),
-      h("a", { class: "btn primary", href: "#/routes/new" }, "Add route")),
+      h("div", { class: "row" }, h("a", { class: "btn", href: "#/import" }, "Import"), h("a", { class: "btn primary", href: "#/routes/new" }, "Add route"))),
     board);
 
   const load = async () => {
@@ -465,15 +489,22 @@ function routeRow(r, httpsOn, reload) {
     h("div", { class: "host" },
       h("a", { href: `${scheme}://${r.hostname}`, target: "_blank", rel: "noopener noreferrer" }, r.hostname),
       h("div", { class: "meta" }, certPill(r.cert, httpsOn), " ", accessPill(r.config.access), " ",
+        r.config.expiresAt ? h("span", { class: "pill " + (new Date(r.config.expiresAt) < new Date() ? "bad" : "wait"), title: fmtTime(r.config.expiresAt) },
+          new Date(r.config.expiresAt) < new Date() ? "Expired" : "Until " + new Date(r.config.expiresAt).toLocaleString([], { dateStyle: "short", timeStyle: "short" })) : null, " ",
         r.config.targets.length > 1 ? (r.config.loadBalancing === "failover" ? "Failover" : "Load balanced") : "")),
     h("div", { class: "wire", "data-state": ws, role: "img", "aria-label": stateLabel, title: stateLabel }),
-    h("ul", { class: "targets", "aria-label": "Services" },
-      r.config.targets.map((t) => {
-        const st = health[t.url];
-        const cls = st?.state === "up" ? "up" : st?.state === "down" ? "down" : "";
-        const tip = st?.state === "down" ? `Down: ${st.lastError || "not responding"}` : st?.state === "up" ? `Up, ${st.latencyMs} ms` : "Not checked";
-        return h("li", { title: tip }, h("span", { class: "dot " + cls, "aria-label": tip }), t.url);
-      })),
+    ["ssh", "rdp", "vnc"].includes(r.config.kind)
+      ? h("ul", { class: "targets", "aria-label": "Machine" }, h("li", {}, { ssh: "Terminal", rdp: "Windows desktop", vnc: "Desktop" }[r.config.kind], " · ", r.config.console.address))
+      : r.config.kind === "redirect"
+      ? h("ul", { class: "targets", "aria-label": "Redirect" }, h("li", {}, "→ ", r.config.redirect.to, r.config.redirect.keepPath ? "/…" : ""))
+      : h("ul", { class: "targets", "aria-label": "Services" },
+        [...r.config.targets.map((t) => ["", t]), ...(r.config.paths || []).flatMap((p) => p.targets.map((t) => [p.prefix + " → ", t]))].map(([prefix, t]) => {
+          const st = health[t.url];
+          const cls = st?.state === "up" ? "up" : st?.state === "down" ? "down" : "";
+          const tip = st?.state === "down" ? `Down: ${st.lastError || "not responding"}` : st?.state === "up" ? `Up, ${st.latencyMs} ms` : "Not checked";
+          const up = st && st.uptime >= 0 ? h("span", { class: "uptime", title: "Uptime over the last 24 hours" }, `${(st.uptime * 100).toFixed(st.uptime === 1 ? 0 : 1)}%`) : null;
+          return h("li", { title: tip }, h("span", { class: "dot " + cls, "aria-label": tip }), prefix, t.url, up);
+        })),
     h("div", { class: "tools" }, h("a", { class: "btn small", href: `#/routes/${r.id}` }, "Edit")));
 }
 
@@ -482,7 +513,10 @@ function defaultRoute() {
   return {
     hostname: "", enabled: true,
     config: {
-      targets: [{ url: "" }], loadBalancing: "round_robin", tlsSkipVerify: false, websockets: true,
+      kind: "proxy", targets: [{ url: "" }], paths: [], landingPath: "",
+      redirect: { to: "", code: 301, keepPath: true }, rateLimit: { requestsPerMinute: 0 },
+      console: { address: "", username: "", auth: "", hostKey: "", domain: "", security: "any", ignoreCert: false },
+      loadBalancing: "round_robin", tlsSkipVerify: false, websockets: true,
       httpsRedirect: true, preserveHost: false, requestHeaders: [], responseHeaders: [],
       healthCheck: { enabled: false, path: "/", intervalSeconds: 15 },
       access: { mode: "private", users: [] },
@@ -493,7 +527,11 @@ function defaultRoute() {
 async function routeEditor(id) {
   let route = defaultRoute();
   let people, settings;
-  try { [people, settings] = await Promise.all([api("GET", "/api/people"), api("GET", "/api/settings")]); } catch { return; }
+  let sites = [];
+  try { [people, settings, { sites }] = await Promise.all([api("GET", "/api/people"), api("GET", "/api/settings"), api("GET", "/api/sites")]); } catch { return; }
+  const siteSelect = (value, label) => h("select", { "aria-label": label || "Reached" },
+    h("option", { value: "0" }, "Directly"),
+    sites.map((x) => h("option", { value: String(x.id), selected: x.id === value }, `Through ${x.name}`)));
   if (id == null) route.config.access.users = [people.me]; // you, to start with
   if (id != null) {
     try {
@@ -505,6 +543,12 @@ async function routeEditor(id) {
       route.config.responseHeaders ||= [];
       route.config.access ||= { mode: "private", users: [] };
       route.config.access.users ||= [];
+      route.config.kind ||= "proxy";
+      route.config.paths ||= [];
+      route.config.redirect = route.config.redirect?.to ? route.config.redirect : { to: "", code: 301, keepPath: true };
+      route.config.rateLimit ||= { requestsPerMinute: 0 };
+      route.config.console ||= { address: "", username: "", auth: "" };
+      if (!route.config.targets?.length) route.config.targets = [{ url: "" }];
     } catch { return; }
   }
   const c = route.config;
@@ -542,8 +586,9 @@ async function routeEditor(id) {
 
   // Targets
   const tlist = h("div", { class: "target-list" });
-  const addTarget = (url) => {
+  const addTarget = (url, site) => {
     const input = h("input", { type: "text", value: url, placeholder: "http://192.168.1.10:8080", spellcheck: "false", autocapitalize: "off", "aria-label": "Service address" });
+    const via = sites.length ? siteSelect(site || 0, "How RyProx reaches this service") : null;
     const result = h("div", { class: "test-result", hidden: true });
     const testBtn = h("button", { class: "btn small", type: "button" }, "Test");
     testBtn.addEventListener("click", async () => {
@@ -551,7 +596,7 @@ async function routeEditor(id) {
       result.hidden = false;
       result.replaceChildren(h("span", { class: "muted" }, "Connecting…"));
       try {
-        const st = await api("POST", "/api/test-target", { url: input.value, tlsSkipVerify: skip.querySelector("input").checked });
+        const st = await api("POST", "/api/test-target", { url: input.value, tlsSkipVerify: skip.querySelector("input").checked, site: via ? Number(via.value) : 0 });
         result.replaceChildren(st.state === "up"
           ? h("span", {}, h("span", { class: "dot up" }), ` Reachable in ${st.latencyMs} ms`)
           : h("span", { class: "err" }, h("span", { class: "dot down" }), ` Not reachable: ${st.lastError}`));
@@ -560,7 +605,7 @@ async function routeEditor(id) {
       } finally { busy(testBtn, false); }
     });
     const rm = h("button", { class: "btn small", type: "button", "aria-label": "Remove service" }, "Remove");
-    const item = h("div", { class: "target-item" }, input, testBtn, rm, result);
+    const item = h("div", { class: "target-item" + (via ? " with-site" : "") }, input, via, testBtn, rm, result);
     rm.addEventListener("click", () => { if (tlist.children.length > 1) { item.remove(); renumber(); } });
     tlist.append(item);
     renumber();
@@ -583,7 +628,7 @@ async function routeEditor(id) {
     });
     lbWrap.hidden = tlist.children.length < 2;
   };
-  c.targets.forEach((t) => addTarget(t.url));
+  c.targets.forEach((t) => addTarget(t.url, t.site));
 
   // Options
   const redirect = toggle("Redirect HTTP to HTTPS", "Visitors who type http:// are sent to the secure address.", c.httpsRedirect);
@@ -627,6 +672,107 @@ async function routeEditor(id) {
   const reqRules = rulesEditor(c.requestHeaders, "requestHeaders", "X-Example");
   const resRules = rulesEditor(c.responseHeaders, "responseHeaders", "X-Frame-Options");
 
+  // What the route does: proxy to services, or redirect elsewhere.
+  const kindProxy = h("input", { type: "radio", name: "kind", value: "proxy", checked: c.kind !== "redirect", "data-field": "kind" });
+  const kindRedirect = h("input", { type: "radio", name: "kind", value: "redirect", checked: c.kind === "redirect" });
+  const kindSSH = h("input", { type: "radio", name: "kind", value: "ssh", checked: c.kind === "ssh" });
+  const kindRDP = h("input", { type: "radio", name: "kind", value: "rdp", checked: c.kind === "rdp" });
+  const kindVNC = h("input", { type: "radio", name: "kind", value: "vnc", checked: c.kind === "vnc" });
+  const kindOf = () => [kindProxy, kindRedirect, kindSSH, kindRDP, kindVNC].find((x) => x.checked)?.value || "proxy";
+
+  // Console (SSH / RDP / VNC)
+  const k = c.console;
+  const cAddr = h("input", { type: "text", "data-field": "console.address", value: k.address || "", placeholder: "192.168.1.20", spellcheck: "false", autocapitalize: "off", class: "mono" });
+  const cUser = h("input", { type: "text", "data-field": "console.username", value: k.username || "", placeholder: "Leave empty to ask each time", spellcheck: "false", autocapitalize: "off" });
+  const cAuth = h("select", { "data-field": "console.auth" });
+  const cPass = h("input", { type: "password", "data-field": "console.password", autocomplete: "new-password", placeholder: k.hasPassword ? "Saved (leave empty to keep)" : "" });
+  const cHostKey = h("input", { type: "text", "data-field": "console.hostKey", value: k.hostKey || "", placeholder: "Learned on first connect", spellcheck: "false", class: "mono" });
+  const cDomain = h("input", { type: "text", "data-field": "console.domain", value: k.domain || "", spellcheck: "false" });
+  const cSec = h("select", { "data-field": "console.security" }, h("option", { value: "any" }, "Automatic"), h("option", { value: "nla" }, "NLA"),
+    h("option", { value: "tls" }, "TLS"), h("option", { value: "rdp" }, "Standard RDP"));
+  cSec.value = k.security || "any";
+  const cIgnore = toggle("Accept the PC's self-signed certificate", "Windows uses one by default. Only turn this off if the PC has a trusted certificate.", k.ignoreCert ?? true);
+  const keyNote = h("div", { class: "hint mt" });
+  const passWrap = h("div", {}, field("Password to save", cPass, "Encrypted on this server. Anyone you give access to this route can use it."));
+  const sshOnly = h("div", {}, field("Server key fingerprint", cHostKey, "RyProx refuses to connect if the server's key changes. Leave empty to learn it the first time."),
+    id != null ? h("button", { class: "btn small", type: "button", onclick: async () => {
+      try { await api("DELETE", `/api/routes/${id}/host-key`); toast("The server's key will be learned again on the next connect."); } catch (e) { toast(e.message, "error"); }
+    } }, "Forget learned key") : null, keyNote);
+  const rdpOnly = h("div", {}, h("div", { class: "two" }, field("Windows domain", cDomain, "Usually empty."), field("Security", cSec)), cIgnore);
+  const cSite = sites.length ? siteSelect(k.site || 0, "How RyProx reaches this machine") : null;
+  if (cSite) cSite.dataset.field = "console.site";
+  const consoleSection = h("section", { class: "section" },
+    h("header", {}, h("h2", {}, "Machine"), h("p", {}, "The computer to open. People get a sign-in page, then the terminal or desktop, all in the browser.")),
+    field("Address", cAddr, "Its address on your network, optionally with a port (default 22 for SSH, 3389 for RDP, 5900 for VNC)."),
+    cSite ? field("Reached", cSite, "Directly, or through a site connector for machines on another network.") : null,
+    field("Username", cUser), field("Sign-in", cAuth), passWrap, sshOnly, rdpOnly);
+  const syncConsole = () => {
+    const kind = kindOf();
+    const opts = kind === "ssh" ? [["key", "RyProx's SSH key (recommended)"], ["ask", "Ask for the password each time"]]
+      : [["ask", "Ask for the password each time"], ["stored", "Save the password here"]];
+    const cur = cAuth.value || k.auth;
+    cAuth.replaceChildren(...opts.map(([v, l]) => h("option", { value: v }, l)));
+    cAuth.value = opts.some(([v]) => v === cur) ? cur : opts[0][0];
+    passWrap.hidden = kind === "ssh" || cAuth.value !== "stored";
+    sshOnly.hidden = kind !== "ssh";
+    rdpOnly.hidden = kind !== "rdp";
+    cUser.parentElement.querySelector("span").textContent = kind === "vnc" ? "Account name (optional, for macOS)" : "Username";
+    if (kind === "ssh" && cAuth.value === "key" && !keyNote.dataset.loaded) {
+      keyNote.dataset.loaded = "1";
+      api("GET", "/api/console").then((r) => keyNote.replaceChildren("Add this line to ~/.ssh/authorized_keys on the server:",
+        h("div", { class: "secret mt" }, r.publicKey), h("button", { class: "btn small mt", type: "button", onclick: () => copy(r.publicKey) }, "Copy"))).catch(() => {});
+    }
+    keyNote.hidden = !(kind === "ssh" && cAuth.value === "key");
+  };
+  cAuth.addEventListener("change", syncConsole);
+  const rdTo = h("input", { type: "text", "data-field": "redirect.to", value: c.redirect.to, placeholder: "https://example.com", spellcheck: "false", autocapitalize: "off", class: "mono" });
+  const rdCode = h("select", { "data-field": "redirect.code" },
+    h("option", { value: "301" }, "Permanent (301)"), h("option", { value: "302" }, "Temporary (302)"),
+    h("option", { value: "308" }, "Permanent, keep method (308)"), h("option", { value: "307" }, "Temporary, keep method (307)"));
+  rdCode.value = String(c.redirect.code || 301);
+  const rdKeep = toggle("Keep the rest of the address", "www.example.com/a?b=1 goes to example.com/a?b=1, not just example.com.", c.redirect.keepPath);
+  const redirectSection = h("section", { class: "section" },
+    h("header", {}, h("h2", {}, "Redirect"), h("p", {}, "Visitors to this domain are sent straight to another address.")),
+    field("Send visitors to", rdTo, "The full address, starting with https://"),
+    field("Kind of redirect", rdCode, "Use permanent for things like www to the bare domain."),
+    rdKeep);
+
+  // Start page and path rules
+  const landing = h("input", { type: "text", "data-field": "landingPath", value: c.landingPath || "", placeholder: "/page1", spellcheck: "false", autocapitalize: "off", class: "mono" });
+  const plist = h("div", { class: "rules" });
+  const addPath = (rule) => {
+    const prefix = h("input", { type: "text", value: rule.prefix || "", placeholder: "/api", "aria-label": "Path", spellcheck: "false", autocapitalize: "off", class: "mono" });
+    const target = h("input", { type: "text", value: (rule.targets || []).map((t) => t.url).join(", "), placeholder: "http://192.168.1.11:9000", "aria-label": "Service for this path", spellcheck: "false", autocapitalize: "off", class: "mono" });
+    const strip = h("label", { class: "pick", title: "Remove the path before sending, so /api/users reaches the service as /users" },
+      h("input", { type: "checkbox", checked: !!rule.stripPrefix }), h("span", {}, "Strip"));
+    const rm = h("button", { class: "btn small", type: "button", "aria-label": "Remove path rule" }, "Remove");
+    const via = sites.length ? siteSelect(rule.targets?.[0]?.site || 0, "How RyProx reaches this path's service") : null;
+    const row = h("div", { class: "rule path-rule" + (via ? " with-site" : "") }, prefix, target, via, strip, rm);
+    rm.addEventListener("click", () => { row.remove(); renumPaths(); });
+    plist.append(row);
+    renumPaths();
+  };
+  const renumPaths = () => [...plist.children].forEach((row, i) => {
+    const [p, t] = row.querySelectorAll("input[type=text]");
+    p.dataset.field = `paths.${i}.prefix`;
+    t.dataset.field = `paths.${i}.targets.0`;
+  });
+  c.paths.forEach(addPath);
+  const readPaths = () => [...plist.children].map((row) => {
+    const [p, t] = row.querySelectorAll("input[type=text]");
+    const site = Number(row.querySelector("select")?.value || 0);
+    return { prefix: p.value.trim(), targets: t.value.split(",").map((u) => u.trim()).filter(Boolean).map((url) => ({ url, site })),
+      stripPrefix: row.querySelector("input[type=checkbox]").checked };
+  });
+
+  // Limits and expiry
+  const rate = h("input", { type: "number", min: 0, max: 1000000, "data-field": "rateLimit.requestsPerMinute", value: c.rateLimit.requestsPerMinute || 0 });
+  const toLocal = (iso) => { const d = new Date(iso); d.setMinutes(d.getMinutes() - d.getTimezoneOffset()); return d.toISOString().slice(0, 16); };
+  const temp = toggle("Temporary route", "Stops working at the time you choose. Handy for sharing something for a day.", !!c.expiresAt);
+  const expires = h("input", { type: "datetime-local", "data-field": "expiresAt", value: c.expiresAt ? toLocal(c.expiresAt) : toLocal(Date.now() + 86400000) });
+  const expiresWrap = h("div", { hidden: !c.expiresAt }, field("Stops working at", expires, "Your local time."));
+  temp.querySelector("input").addEventListener("change", (e) => { expiresWrap.hidden = !e.target.checked; });
+
   const saveBtn = h("button", { class: "btn primary", type: "submit" }, id == null ? "Add route" : "Save changes");
   const delBtn = id == null ? null : h("button", { class: "btn danger", type: "button" }, "Delete route");
 
@@ -634,25 +780,43 @@ async function routeEditor(id) {
     h("section", { class: "section" },
       h("header", {}, h("h2", {}, "Domain")),
       field("Domain name", host, "Point this domain's DNS at this server first."),
-      enabled),
+      enabled,
+      h("label", { class: "switch mt" }, kindProxy, h("span", {}, h("b", {}, "Send to services on my network"), h("small", {}, "A normal reverse proxy route."))),
+      h("label", { class: "switch" }, kindRedirect, h("span", {}, h("b", {}, "Redirect to another address"), h("small", {}, "For example www.example.com to example.com."))),
+      h("label", { class: "switch" }, kindSSH, h("span", {}, h("b", {}, "Terminal (SSH)"), h("small", {}, "A command line on a server, in the browser."))),
+      h("label", { class: "switch" }, kindRDP, h("span", {}, h("b", {}, "Windows desktop (RDP)"), h("small", {}, "Needs guacd; see Settings."))),
+      h("label", { class: "switch" }, kindVNC, h("span", {}, h("b", {}, "Mac or Linux desktop (VNC)"), h("small", {}, "macOS Screen Sharing or any VNC server. Needs guacd.")))),
+    redirectSection, consoleSection,
     h("section", { class: "section" },
       h("header", {}, h("h2", {}, "Who can open this site?"), h("p", {}, "RyProx checks every request. People must sign in with their password and authenticator code.")),
       h("label", { class: "switch" }, accessPrivate, h("span", {}, h("b", {}, "Only people I choose"), h("small", {}, "Recommended. Everyone else gets a sign-in page."))),
       peopleList, noOne, httpsNote, invitePeople,
       h("label", { class: "switch mt" }, accessPublic, h("span", {}, h("b", {}, "Anyone on the internet"), h("small", {}, "No sign-in. For public websites."))),
       publicWarn),
-    h("section", { class: "section" },
+    h("section", { class: "section proxy-only" },
       h("header", {}, h("h2", {}, "Services"), h("p", {}, "Where visitors are sent. Use the address you'd type on your own network.")),
       tlist,
-      h("button", { class: "btn small", type: "button", onclick: () => addTarget("") }, "Add another service"),
-      h("div", { class: "mt" }, lbWrap)),
-    h("section", { class: "section" },
+      h("button", { class: "btn small", type: "button", onclick: () => addTarget("", 0) }, "Add another service"),
+      h("div", { class: "mt" }, lbWrap),
+      h("p", { class: "muted mt" }, "If the app lives under a sub-path on its server, include it: http://192.168.1.10:8080/app.")),
+    h("section", { class: "section proxy-only" },
+      h("header", {}, h("h2", {}, "Pages and paths"), h("p", {}, "Optional. Open a specific page by default, or send parts of the site to other services.")),
+      field("Start page", landing, "Visitors who open the bare domain land here, for example /page1. Leave empty for the home page."),
+      h("h3", { class: "mt-l" }, "Path rules"),
+      h("p", { class: "muted" }, "Requests starting with the path go to its service. The longest matching path wins."),
+      plist,
+      h("button", { class: "btn small", type: "button", onclick: () => addPath({}) }, "Add path rule")),
+    h("section", { class: "section proxy-only" },
       h("header", {}, h("h2", {}, "Options")),
       redirect, ws, preserve, skip, skipWarn),
     h("section", { class: "section" },
+      h("header", {}, h("h2", {}, "Limits")),
+      field("Requests per minute from one address", rate, "0 means no limit. Visitors over the limit are asked to wait."),
+      temp, expiresWrap),
+    h("section", { class: "section proxy-only" },
       h("header", {}, h("h2", {}, "Health check")),
       hc, hcFields),
-    h("details", { class: "section" },
+    h("details", { class: "section proxy-only" },
       h("summary", {}, h("b", {}, "Header rules"), h("span", { class: "muted" }, " (advanced)")),
       h("div", { class: "mt" },
         h("h3", {}, "Sent to the service"), h("p", { class: "muted" }, "Add or remove headers on requests going to your service."), reqRules.el,
@@ -664,6 +828,18 @@ async function routeEditor(id) {
   accessPrivate.addEventListener("change", syncPeople);
   accessPublic.addEventListener("change", syncPeople);
   syncPeople();
+  const syncKind = () => {
+    const kind = kindOf();
+    redirectSection.hidden = kind !== "redirect";
+    consoleSection.hidden = !["ssh", "rdp", "vnc"].includes(kind);
+    form.querySelectorAll(".proxy-only").forEach((el) => { el.hidden = kind !== "proxy"; });
+    const isConsole = !consoleSection.hidden;
+    accessPublic.disabled = isConsole;
+    if (isConsole && accessPublic.checked) { accessPrivate.checked = true; syncPeople(); }
+    if (isConsole) syncConsole();
+  };
+  [kindProxy, kindRedirect, kindSSH, kindRDP, kindVNC].forEach((x) => x.addEventListener("change", syncKind));
+  syncKind();
 
   form.addEventListener("submit", async (ev) => {
     ev.preventDefault();
@@ -672,7 +848,15 @@ async function routeEditor(id) {
       hostname: host.value,
       enabled: enabled.querySelector("input").checked,
       config: {
-        targets: [...tlist.querySelectorAll("input")].map((i) => ({ url: i.value })),
+        kind: kindOf(),
+        console: { site: cSite ? Number(cSite.value) : 0, address: cAddr.value, username: cUser.value, auth: cAuth.value, password: cPass.value, hostKey: cHostKey.value,
+          domain: cDomain.value, security: cSec.value, ignoreCert: cIgnore.querySelector("input").checked },
+        redirect: { to: rdTo.value, code: Number(rdCode.value), keepPath: rdKeep.querySelector("input").checked },
+        landingPath: landing.value.trim(),
+        paths: readPaths(),
+        rateLimit: { requestsPerMinute: Number(rate.value) || 0 },
+        expiresAt: temp.querySelector("input").checked && expires.value ? new Date(expires.value).toISOString() : null,
+        targets: [...tlist.children].map((item) => ({ url: item.querySelector("input").value, site: Number(item.querySelector("select")?.value || 0) })),
         loadBalancing: lb.value,
         tlsSkipVerify: skip.querySelector("input").checked,
         websockets: ws.querySelector("input").checked,
@@ -696,6 +880,7 @@ async function routeEditor(id) {
       busy(saveBtn, false);
       // Errors on header rules live inside a closed <details>.
       if (e.field && /Headers/.test(e.field)) form.querySelector("details").open = true;
+      if (e.field && /^paths\.\d+\.targets\.\d+$/.test(e.field)) e.field = e.field.replace(/targets\.\d+$/, "targets.0");
       if (e.field && /^(requestHeaders|responseHeaders)\.\d+$/.test(e.field)) {
         const el = form.querySelector(`[data-field="${e.field}"]`);
         if (el) { el.setAttribute("aria-invalid", "true"); el.focus(); }
@@ -867,14 +1052,409 @@ async function settingsPage() {
       } }, "Sign out all other devices")) : null);
   };
 
+  const csBox = crowdsecEditor();
+  const nodesBox = nodesEditor();
+  const rdBox = remoteEditor();
+  const pkBox = passkeysBox("/api/account/passkeys");
+  const tokBox = tokensBox("/api/account/tokens", true);
+  const ssoBox = ssoEditor();
+
   shell("settings",
     h("div", { class: "page-head" }, h("div", {}, h("h1", {}, "Settings"))),
     h("section", { class: "section" }, h("header", {}, h("h2", {}, "HTTPS")), httpsForm),
+    h("section", { class: "section" }, h("header", {}, h("h2", {}, "Servers"),
+      h("p", {}, "Run RyProx on more than one server. Followers copy this server's configuration and certificates and keep serving if it goes down.")), nodesBox),
+    h("section", { class: "section" }, h("header", {}, h("h2", {}, "Terminals and remote desktops"),
+      h("p", {}, "SSH works out of the box. Windows (RDP) and Mac/VNC desktops go through guacd, Apache Guacamole's connection service, which runs next to RyProx.")), rdBox),
+    h("section", { class: "section" }, h("header", {}, h("h2", {}, "CrowdSec"),
+      h("p", {}, "Block addresses that CrowdSec has banned, on every site and the sign-in page.")), csBox),
+    h("section", { class: "section" }, h("header", {}, h("h2", {}, "Single sign-on"),
+      h("p", {}, "Let people sign in to private sites with Google, Microsoft, Authentik or another OpenID Connect provider. Only people whose email you've set on the People page can sign in this way.")), ssoBox),
     h("section", { class: "section" }, h("header", {}, h("h2", {}, "Password")), pwForm),
     h("section", { class: "section" }, h("header", {}, h("h2", {}, "Recovery codes"), h("p", {}, "Use one to sign in if you lose your authenticator app.")), rcForm),
+    h("section", { class: "section" }, h("header", {}, h("h2", {}, "Passkeys"),
+      h("p", {}, "Sign in with your fingerprint, face or device PIN instead of a password and code. A passkey only works on the address it was added on.")), pkBox),
+    h("section", { class: "section" }, h("header", {}, h("h2", {}, "Access tokens"),
+      h("p", {}, "For scripts and apps. A sites token opens your private sites without a browser (send it as Authorization: Bearer <token>). An admin token uses this dashboard's API.")), tokBox),
     h("section", { class: "section" }, h("header", {}, h("h2", {}, "Signed-in devices")), sessBox),
     h("p", { class: "muted" }, `RyProx ${state.version}`));
   loadSessions();
+}
+
+// ---------- passkeys & tokens (also used on the sign-in page) ----------
+function passkeysBox(base) {
+  const box = h("div", {});
+  const load = async () => {
+    let r;
+    try { r = await api("GET", base); } catch { return; }
+    const pw = h("input", { type: "password", autocomplete: "current-password", "data-field": "password" });
+    const name = h("input", { type: "text", "data-field": "name", placeholder: "My laptop", maxlength: 60 });
+    const add = h("button", { class: "btn", type: "submit" }, "Add a passkey");
+    const form = h("form", { novalidate: true, class: "mt" },
+      h("div", { class: "two" }, field("Name", name), field("Confirm your password", pw)),
+      h("div", { class: "actions" }, add));
+    form.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      clearErrors(form);
+      if (!window.RyPasskey?.supported()) return showError(form, { message: "This browser doesn't support passkeys." });
+      busy(add, true, "Waiting for your device…");
+      try {
+        const opts = await api("POST", base + "/begin", { password: pw.value });
+        const cred = await window.RyPasskey.create(opts);
+        await api("POST", `${base}/finish?name=${encodeURIComponent(name.value || "Passkey")}`, cred);
+        toast("Passkey added.");
+        load();
+      } catch (e) {
+        busy(add, false);
+        showError(form, e instanceof ApiError ? e : { message: window.RyPasskey.message(e) });
+      }
+    });
+    box.replaceChildren(
+      r.passkeys.length ? h("ul", { class: "plain-list" }, r.passkeys.map((k) => h("li", {},
+        h("span", {}, h("b", {}, k.name), h("span", { class: "muted" }, " · added ", ago(k.createdAt), k.lastUsedAt && !k.lastUsedAt.startsWith("0001") ? ", last used " + ago(k.lastUsedAt) : "")),
+        h("button", { class: "btn small", type: "button", onclick: async () => {
+          if (!(await confirmDialog("Remove this passkey?", `${k.name} won't be able to sign in any more.`, "Remove"))) return;
+          try { await api("DELETE", `${base}/${k.id}`); toast("Passkey removed."); load(); } catch (e) { toast(e.message, "error"); }
+        } }, "Remove")))) : h("p", { class: "muted" }, "No passkeys yet."),
+      form);
+  };
+  load();
+  return box;
+}
+
+function tokensBox(base, allowAdmin) {
+  const box = h("div", {});
+  const out = h("div", {});
+  const load = async () => {
+    let r;
+    try { r = await api("GET", base); } catch { return; }
+    const name = h("input", { type: "text", "data-field": "name", placeholder: "Backup script", maxlength: 60 });
+    const scope = h("select", { "data-field": "scope" }, h("option", { value: "sites" }, "Open my private sites"),
+      allowAdmin ? h("option", { value: "admin" }, "Manage RyProx (admin API)") : null);
+    const exp = h("select", { "data-field": "expiresDays" }, h("option", { value: "30" }, "30 days"), h("option", { value: "90" }, "90 days"),
+      h("option", { value: "365" }, "1 year"), h("option", { value: "0" }, "Never"));
+    const add = h("button", { class: "btn", type: "submit" }, "Create token");
+    const form = h("form", { novalidate: true, class: "mt" }, h("div", { class: "three" }, field("Name", name), field("Can", scope), field("Expires after", exp)),
+      h("div", { class: "actions" }, add));
+    form.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      clearErrors(form);
+      busy(add, true);
+      try {
+        const t = await api("POST", base, { name: name.value, scope: scope.value, expiresDays: Number(exp.value) });
+        out.replaceChildren(h("div", { class: "banner" }, h("p", {}, h("b", {}, "Copy this token now. "), "It won't be shown again."),
+          h("div", { class: "secret mono" }, t.token),
+          h("div", { class: "row" }, h("button", { class: "btn small", type: "button", onclick: () => copy(t.token) }, "Copy"))));
+        load();
+      } catch (e) { busy(add, false); showError(form, e); }
+    });
+    const scopeName = { sites: "Opens private sites", admin: "Admin API" };
+    box.replaceChildren(out,
+      r.tokens.length ? h("ul", { class: "plain-list" }, r.tokens.map((t) => h("li", {},
+        h("span", {}, h("b", {}, t.name), h("span", { class: "muted" }, ` · ${scopeName[t.scope] || t.scope}`,
+          t.expiresAt && !t.expiresAt.startsWith("0001") ? ` · expires ${new Date(t.expiresAt).toLocaleDateString()}` : " · never expires",
+          t.lastUsedAt && !t.lastUsedAt.startsWith("0001") ? ` · used ${ago(t.lastUsedAt)}` : " · never used")),
+        h("button", { class: "btn small", type: "button", onclick: async () => {
+          if (!(await confirmDialog("Delete this token?", `Anything using "${t.name}" will stop working.`, "Delete"))) return;
+          try { await api("DELETE", `${base}/${t.id}`); toast("Token deleted."); out.replaceChildren(); load(); } catch (e) { toast(e.message, "error"); }
+        } }, "Delete")))) : h("p", { class: "muted" }, "No tokens yet."),
+      form);
+  };
+  load();
+  return box;
+}
+
+function nodesEditor() {
+  const box = h("div", {});
+  const out = h("div", {});
+  const load = async () => {
+    let r;
+    try { r = await api("GET", "/api/nodes"); } catch { return; }
+    if (r.follower) {
+      box.replaceChildren(h("p", {}, "This server is a follower of ", h("span", { class: "mono" }, r.follower.primary), ". ",
+        r.follower.lastSync && !r.follower.lastSync.startsWith("0001") ? `Last copied ${ago(r.follower.lastSync)}.` : ""),
+        h("p", { class: "muted" }, "To make it the primary, restart it without RYPROX_FOLLOW."));
+      return;
+    }
+    const name = h("input", { type: "text", "data-field": "name", placeholder: "backup", maxlength: 60 });
+    const add = h("button", { class: "btn", type: "submit" }, "Add server");
+    const form = h("form", { novalidate: true, class: "mt" }, field("Name", name), h("div", { class: "actions" }, add));
+    form.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      clearErrors(form);
+      busy(add, true);
+      try {
+        const n = await api("POST", "/api/nodes", { name: name.value });
+        const primary = n.primary || "https://<your sign-in domain>";
+        const cmd = `curl -fsSL https://raw.githubusercontent.com/RylanQ/ryprox/main/install.sh | sudo bash -s -- --follow ${primary} --follow-token ${n.token}`;
+        out.replaceChildren(h("div", { class: "banner" },
+          h("p", {}, h("b", {}, "Copy this now. "), "The token won't be shown again. It gives the new server a full copy of this one, so keep it safe."),
+          h("p", {}, "On the new server, run:"), h("pre", { class: "secret" }, cmd),
+          h("div", { class: "row" }, h("button", { class: "btn small", type: "button", onclick: () => copy(cmd) }, "Copy")),
+          h("p", { class: "muted mt" }, "Then point your DNS at both servers (with health checks), or use a floating IP. For site connectors, list every server in RYPROX_SERVER.")));
+        name.value = "";
+        load();
+      } catch (e) { showError(form, e); }
+      finally { busy(add, false); }
+    });
+    box.replaceChildren(out,
+      r.nodes.length ? h("ul", { class: "plain-list" }, r.nodes.map((n) => h("li", {},
+        h("span", {}, h("b", {}, n.name), h("span", { class: "muted" },
+          n.lastSeenAt && !n.lastSeenAt.startsWith("0001") ? ` · last copied ${ago(n.lastSeenAt)} from ${n.lastIp}` : " · not connected yet")),
+        h("button", { class: "btn small", type: "button", onclick: async () => {
+          if (!(await confirmDialog(`Remove ${n.name}?`, "It stops receiving changes. It keeps serving its last copy until you turn it off.", "Remove"))) return;
+          try { await api("DELETE", `/api/nodes/${n.id}`); load(); } catch (e) { toast(e.message, "error"); }
+        } }, "Remove")))) : h("p", { class: "muted" }, "Only this server so far."),
+      form);
+  };
+  load();
+  return box;
+}
+
+function remoteEditor() {
+  const box = h("div", {});
+  const load = async () => {
+    let r;
+    try { r = await api("GET", "/api/console"); } catch { return; }
+    const addr = h("input", { type: "text", "data-field": "guacd", value: r.guacd, class: "mono", spellcheck: "false" });
+    const save = h("button", { class: "btn", type: "submit" }, "Save and test");
+    const form = h("form", { novalidate: true },
+      field("guacd address", addr, "127.0.0.1:4822 when installed on this server, guacd:4822 with the Docker install."),
+      h("p", { class: r.guacdOk ? "muted" : "warn-inline" }, r.guacdOk ? "guacd is running." : `guacd isn't reachable${r.guacdError ? ": " + r.guacdError : ""}. Remote desktops won't work until it is.`),
+      h("div", { class: "actions" }, save),
+      h("h3", { class: "mt-l" }, "RyProx's SSH key"),
+      h("p", { class: "muted" }, "Terminal routes can sign in with this key. Add it to ~/.ssh/authorized_keys on each server."),
+      h("div", { class: "secret" }, r.publicKey),
+      h("div", { class: "row mt" }, h("button", { class: "btn small", type: "button", onclick: () => copy(r.publicKey) }, "Copy")));
+    form.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      clearErrors(form);
+      busy(save, true, "Testing…");
+      try { await api("PUT", "/api/console", { guacd: addr.value.trim() }); load(); }
+      catch (e) { busy(save, false); showError(form, e); }
+    });
+    box.replaceChildren(form);
+  };
+  load();
+  return box;
+}
+
+function crowdsecEditor() {
+  const box = h("div", {});
+  let timer = null;
+  const load = async () => {
+    let r;
+    try { r = await api("GET", "/api/crowdsec"); } catch { return; }
+    const on = toggle("Use CrowdSec", "RyProx asks your CrowdSec Local API for bans every 10 seconds and keeps a copy, so lookups are instant.", r.enabled);
+    const url = h("input", { type: "text", "data-field": "url", value: r.url || "http://127.0.0.1:8080", class: "mono", spellcheck: "false" });
+    const key = h("input", { type: "password", "data-field": "apiKey", autocomplete: "off", placeholder: r.hasKey ? "Saved (leave empty to keep)" : "" });
+    const fields = h("div", { hidden: !r.enabled },
+      field("Local API address", url, "Where CrowdSec's Local API listens."),
+      field("Bouncer API key", key, h("span", {}, "Create one on the CrowdSec server with ", h("code", {}, "cscli bouncers add ryprox"), ".")));
+    on.querySelector("input").addEventListener("change", (e) => { fields.hidden = !e.target.checked; });
+    const st = r.status || {};
+    const status = r.enabled ? h("p", { class: st.connected ? "muted" : "warn-inline" },
+      st.connected ? `Connected. ${st.decisions} active ban${st.decisions === 1 ? "" : "s"}, ${st.blocked} request${st.blocked === 1 ? "" : "s"} blocked since start. Last sync ${ago(st.lastSync)}.`
+        : `Not connected${st.lastError ? ": " + st.lastError : " yet"}.`) : null;
+    const save = h("button", { class: "btn primary", type: "submit" }, "Save");
+    const form = h("form", { novalidate: true }, on, fields, status, h("div", { class: "actions" }, save));
+    form.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      clearErrors(form);
+      busy(save, true, "Saving…");
+      try {
+        await api("PUT", "/api/crowdsec", { enabled: on.querySelector("input").checked, url: url.value.trim(), apiKey: key.value.trim() });
+        toast("CrowdSec settings saved.");
+        clearTimeout(timer);
+        timer = setTimeout(load, 1500);
+        load();
+      } catch (e) { busy(save, false); showError(form, e); }
+    });
+    box.replaceChildren(form);
+  };
+  load();
+  return box;
+}
+
+// ---------- sites (tunnels) ----------
+function connectorHelp(server, token) {
+  const docker = `docker run -d --name ryprox-connect --restart unless-stopped --network host \\\n  -e RYPROX_SERVER=${server} -e RYPROX_TOKEN=${token} \\\n  ghcr.io/rylanq/ryprox connect`;
+  const bin = `RYPROX_SERVER=${server} RYPROX_TOKEN=${token} ryprox connect`;
+  return h("div", { class: "banner" },
+    h("p", {}, h("b", {}, "Copy this now. "), "The token won't be shown again. Run the connector on any computer in that network, then use this site on your routes."),
+    h("h3", {}, "With Docker"), h("pre", { class: "secret" }, docker),
+    h("div", { class: "row" }, h("button", { class: "btn small", type: "button", onclick: () => copy(docker.replace(/\\\n\s*/g, "")) }, "Copy")),
+    h("h3", { class: "mt" }, "With the ryprox program"), h("pre", { class: "secret" }, bin),
+    h("div", { class: "row" }, h("button", { class: "btn small", type: "button", onclick: () => copy(bin) }, "Copy")),
+    h("p", { class: "muted mt" }, "Run it on two machines for redundancy: RyProx uses whichever is online. Add RYPROX_ALLOW=192.168.1.0/24 to limit what RyProx can reach there."));
+}
+
+async function sitesPage() {
+  const list = h("div", { "aria-busy": "true" });
+  const out = h("div", {});
+  const name = h("input", { type: "text", "data-field": "name", placeholder: "Home", maxlength: 60 });
+  const add = h("button", { class: "btn primary", type: "submit" }, "Add site");
+  const form = h("form", { novalidate: true, class: "section" },
+    h("header", {}, h("h2", {}, "Add a site")),
+    h("div", { class: "two" }, field("Name", name, "The network, e.g. Home or Office."), h("div", { class: "actions end" }, add)));
+  const load = async () => {
+    let r;
+    try { r = await api("GET", "/api/sites"); } catch { return; }
+    list.removeAttribute("aria-busy");
+    if (!r.server) out.replaceChildren(h("div", { class: "warn-inline" }, "Set a sign-in domain in Settings first: connectors connect there."));
+    list.replaceChildren(r.sites.length ? h("div", { class: "table-wrap" }, h("table", { class: "table" },
+      h("thead", {}, h("tr", {}, ["Site", "Connectors", "Last connected", ""].map((x) => h("th", { scope: "col" }, x)))),
+      h("tbody", {}, r.sites.map((x) => h("tr", {},
+        h("td", {}, h("b", {}, x.name)),
+        h("td", {}, x.online ? h("span", {}, h("span", { class: "dot up" }), ` ${x.agents.length} online`, h("div", { class: "muted mono" }, x.agents.map((a) => a.remote).join(", ")))
+          : h("span", {}, h("span", { class: "dot down" }), " Offline")),
+        h("td", {}, x.lastSeenAt && !x.lastSeenAt.startsWith("0001") ? ago(x.lastSeenAt) : "Never"),
+        h("td", {}, h("div", { class: "row" },
+          h("button", { class: "btn small", type: "button", onclick: async () => {
+            if (!(await confirmDialog("Make a new token?", `Connectors for ${x.name} are disconnected until they use the new token.`, "New token"))) return;
+            try { const t = await api("POST", `/api/sites/${x.id}/token`, {}); out.replaceChildren(connectorHelp(t.server, t.token)); load(); } catch (e) { toast(e.message, "error"); }
+          } }, "New token"),
+          h("button", { class: "btn small danger", type: "button", onclick: async () => {
+            if (!(await confirmDialog(`Delete ${x.name}?`, "Its connectors are disconnected.", "Delete"))) return;
+            try { await api("DELETE", `/api/sites/${x.id}`); toast("Site deleted."); load(); } catch (e) { toast(e.message, "error"); }
+          } }, "Delete")))))))) : h("div", { class: "empty" }, h("h2", {}, "No sites yet"),
+        h("p", {}, "Add a site for each network RyProx can't reach directly, such as a home behind CGNAT. A small connector there dials out to RyProx, so nothing needs to be opened on that network's router.")));
+  };
+  form.addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    clearErrors(form);
+    busy(add, true);
+    try {
+      const r = await api("POST", "/api/sites", { name: name.value });
+      name.value = "";
+      out.replaceChildren(connectorHelp(r.server || "https://<your sign-in domain>", r.token));
+      load();
+    } catch (e) { showError(form, e); }
+    finally { busy(add, false); }
+  });
+  shell("sites",
+    h("div", { class: "page-head" }, h("div", {}, h("h1", {}, "Sites"),
+      h("p", { class: "lede" }, "Networks RyProx reaches through a connector, for services that aren't directly reachable."))),
+    out, form, list);
+  await load();
+  pollTimer = setInterval(load, 10000);
+}
+
+// ---------- import ----------
+async function importPage() {
+  const file = h("input", { type: "file", accept: ".sqlite,.db,application/octet-stream", "aria-label": "Nginx Proxy Manager database" });
+  const btn = h("button", { class: "btn primary", type: "submit" }, "Read file");
+  const out = h("div", {});
+  const form = h("form", { novalidate: true },
+    h("p", {}, "Upload ", h("code", {}, "database.sqlite"), " from Nginx Proxy Manager's ", h("code", {}, "data"), " folder. Nothing changes until you choose what to import."),
+    field("Database file", file), h("div", { class: "actions" }, btn));
+  form.addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    clearErrors(form);
+    if (!file.files[0]) return showError(form, { message: "Choose a file first." });
+    busy(btn, true, "Reading…");
+    let data;
+    try {
+      const res = await fetch("/api/import/npm", { method: "POST", headers: { "X-RyProx": "1", "Content-Type": "application/octet-stream" }, body: file.files[0], credentials: "same-origin" });
+      data = await res.json();
+      if (!res.ok) throw new ApiError(res.status, data);
+    } catch (e) { busy(btn, false); return showError(form, e instanceof ApiError ? e : { message: "Couldn't upload the file." }); }
+    busy(btn, false);
+    if (!data.items.length) { out.replaceChildren(h("p", { class: "muted" }, "No hosts found in that file.")); return; }
+    const rows = data.items.map((it) => {
+      const r = it.route;
+      const cb = h("input", { type: "checkbox", checked: !it.problem, disabled: !!it.problem });
+      const where = r.config.kind === "redirect" ? `→ ${r.config.redirect.to}` : r.config.targets.map((t) => t.url).join(", ") +
+        (r.config.paths?.length ? ` (+${r.config.paths.length} path rule${r.config.paths.length > 1 ? "s" : ""})` : "");
+      const tr = h("tr", {},
+        h("td", {}, cb), h("td", { class: "mono" }, r.hostname),
+        h("td", { class: "mono wrap-any" }, where),
+        h("td", {}, r.config.access.mode === "public" ? "Public" : "Private (you)"),
+        h("td", {}, it.problem ? h("span", { class: "err" }, capitalise(it.problem)) : (it.notes || []).map((n) => h("div", { class: "muted" }, capitalise(n)))));
+      tr.item = it; tr.cb = cb;
+      return tr;
+    });
+    const go2 = h("button", { class: "btn primary", type: "button" }, "Import selected");
+    go2.addEventListener("click", async () => {
+      busy(go2, true, "Importing…");
+      let ok = 0;
+      for (const tr of rows) {
+        if (!tr.cb.checked) continue;
+        const r = tr.item.route;
+        try {
+          await api("POST", "/api/routes", { hostname: r.hostname, enabled: r.enabled, config: r.config });
+          ok++; tr.cb.checked = false; tr.cb.disabled = true;
+          tr.lastChild.replaceChildren(h("span", {}, "Imported"));
+        } catch (e) { tr.lastChild.replaceChildren(h("span", { class: "err" }, capitalise(e.message))); }
+      }
+      busy(go2, false);
+      toast(`${ok} route${ok === 1 ? "" : "s"} imported.`);
+    });
+    out.replaceChildren(
+      h("h2", { class: "mt-l" }, "Found"),
+      h("p", { class: "muted" }, "Imported sites are private to you at first. Review each one afterwards to choose who can open it."),
+      h("div", { class: "table-wrap" }, h("table", { class: "table" },
+        h("thead", {}, h("tr", {}, ["", "Domain", "Goes to", "Access", "Notes"].map((x) => h("th", { scope: "col" }, x)))),
+        h("tbody", {}, rows))),
+      h("div", { class: "actions" }, go2, h("a", { class: "btn", href: "#/" }, "Done")));
+  });
+  shell("routes",
+    h("div", { class: "page-head" }, h("div", {}, h("h1", {}, "Import from Nginx Proxy Manager"),
+      h("p", { class: "lede" }, "Bring your proxy hosts and redirects across."))),
+    h("section", { class: "section" }, form), out);
+}
+
+function ssoEditor() {
+  const box = h("div", {});
+  const load = async () => {
+    let r;
+    try { r = await api("GET", "/api/sso"); } catch { return; }
+    const list = h("div", {});
+    const presets = {
+      google: { id: "google", name: "Google", issuer: "https://accounts.google.com" },
+      microsoft: { id: "microsoft", name: "Microsoft", issuer: "https://login.microsoftonline.com/<tenant-id>/v2.0" },
+      authentik: { id: "authentik", name: "Authentik", issuer: "https://authentik.example.com/application/o/ryprox" },
+    };
+    const addRow = (p) => {
+      const i = list.children.length;
+      const f = (k, label, input, hint) => { input.dataset.field = `providers.${i}.${k}`; return field(label, input, hint); };
+      const id = h("input", { type: "text", value: p.id || "", class: "mono", spellcheck: "false" });
+      const name = h("input", { type: "text", value: p.name || "" });
+      const issuer = h("input", { type: "text", value: p.issuer || "", class: "mono", spellcheck: "false", placeholder: "https://accounts.google.com" });
+      const cid = h("input", { type: "text", value: p.clientId || "", class: "mono", spellcheck: "false" });
+      const secret = h("input", { type: "password", autocomplete: "off", placeholder: p.hasSecret ? "Saved (leave empty to keep)" : "" });
+      const trust = toggle("Trust email addresses from this provider", "Only for a provider you control, like your company's Microsoft tenant. Otherwise RyProx needs the provider to confirm the address is verified.", !!p.trustEmail);
+      const rm = h("button", { class: "btn small", type: "button" }, "Remove");
+      const row = h("div", { class: "sso-row" },
+        h("div", { class: "two" }, f("name", "Button label", name), f("id", "ID", id, "Short, lowercase, used in links")),
+        f("issuer", "Issuer address", issuer), h("div", { class: "two" }, f("clientId", "Client ID", cid), f("clientSecret", "Client secret", secret)),
+        trust, h("div", { class: "actions" }, rm));
+      row.read = () => ({ id: id.value, name: name.value, issuer: issuer.value, clientId: cid.value, clientSecret: secret.value, trustEmail: trust.querySelector("input").checked });
+      rm.addEventListener("click", () => row.remove());
+      list.append(row);
+    };
+    r.providers.forEach(addRow);
+    const save = h("button", { class: "btn primary", type: "submit" }, "Save sign-on providers");
+    const form = h("form", { novalidate: true }, list,
+      h("div", { class: "row" }, Object.entries(presets).map(([k, p]) => h("button", { class: "btn small", type: "button", onclick: () => addRow(p) }, "Add " + p.name)),
+        h("button", { class: "btn small", type: "button", onclick: () => addRow({}) }, "Add other")),
+      r.callbackUrl ? h("p", { class: "muted mt" }, "In the provider, set the redirect URI to ", h("code", {}, r.callbackUrl), ".")
+        : h("p", { class: "warn-inline" }, "Set a sign-in domain above first; providers send people back there."),
+      h("div", { class: "actions" }, save));
+    form.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      clearErrors(form);
+      busy(save, true, "Saving…");
+      try {
+        await api("PUT", "/api/sso", { providers: [...list.children].map((row) => row.read()) });
+        toast("Sign-on providers saved.");
+        load();
+      } catch (e) { busy(save, false); showError(form, e); }
+    });
+    box.replaceChildren(form);
+  };
+  load();
+  return box;
 }
 
 function describeUA(ua) {
@@ -979,7 +1559,9 @@ function personRow(p, me, reload) {
   };
   role.addEventListener("change", () => save({ role: role.value }, `${p.username} is now ${role.value === "admin" ? "an admin" : "a member"}.`));
   return h("tr", { class: p.disabled ? "row-off" : "" },
-    h("td", {}, h("b", {}, p.username), self ? h("div", { class: "muted" }, "You") : null, p.disabled ? h("div", { class: "err" }, "Disabled") : null),
+    h("td", {}, h("b", {}, p.username), self ? h("div", { class: "muted" }, "You") : null, p.disabled ? h("div", { class: "err" }, "Disabled") : null,
+      h("div", {}, h("button", { class: "linkish small", type: "button", title: "Used to match their single sign-on account", onclick: () => editEmail(p, reload) },
+        p.email || "Add email for sign-on"))),
     h("td", {}, role),
     h("td", {}, p.sites.length ? h("div", { class: "mono small-list" }, p.sites.map((x) => h("div", {}, x))) : h("span", { class: "muted" }, "None")),
     h("td", {}, ago(p.lastLoginAt)),
@@ -993,6 +1575,32 @@ function personRow(p, me, reload) {
         catch (e) { toast(e.message, "error"); }
         reload();
       } }, "Remove"))));
+}
+
+async function editEmail(p, reload) {
+  const input = h("input", { type: "email", value: p.email || "", "data-field": "email", placeholder: "name@example.com", autocomplete: "off" });
+  const ok = h("button", { class: "btn primary", type: "submit" }, "Save");
+  const form = h("form", { novalidate: true, method: "dialog" },
+    h("h2", {}, `Sign-on email for ${p.username}`),
+    h("p", { class: "muted" }, "When they sign in with Google, Microsoft or another provider, RyProx matches this address. Leave empty to turn single sign-on off for them."),
+    field("Email", input),
+    h("div", { class: "actions" }, ok, h("button", { class: "btn", type: "button", onclick: () => dlg.close() }, "Cancel")));
+  const dlg = h("dialog", { class: "dialog" }, form);
+  form.addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    clearErrors(form);
+    busy(ok, true);
+    try {
+      await api("PUT", `/api/people/${p.id}/email`, { email: input.value.trim() });
+      dlg.close();
+      toast("Email saved.");
+      reload();
+    } catch (e) { busy(ok, false); showError(form, e); }
+  });
+  dlg.addEventListener("close", () => dlg.remove());
+  document.body.append(dlg);
+  dlg.showModal();
+  input.focus();
 }
 
 // ---------- activity ----------
@@ -1010,7 +1618,9 @@ const actionText = {
 async function activityPage() {
   const body = h("div", { "aria-busy": "true" });
   shell("activity",
-    h("div", { class: "page-head" }, h("div", {}, h("h1", {}, "Activity"), h("p", { class: "lede" }, "Every change and sign-in, newest first."))),
+    h("div", { class: "page-head" }, h("div", {}, h("h1", {}, "Activity"), h("p", { class: "lede" }, "Every change and sign-in, newest first.")),
+      h("div", { class: "row" }, h("a", { class: "btn", href: "/api/activity/export?format=csv", download: "" }, "Export CSV"),
+        h("a", { class: "btn", href: "/api/activity/export?format=json", download: "" }, "Export JSON"))),
     body);
   let list;
   try { list = await api("GET", "/api/activity"); } catch { return; }

@@ -12,16 +12,23 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/rylanq/ryprox/internal/api"
 	"github.com/rylanq/ryprox/internal/certs"
+	"github.com/rylanq/ryprox/internal/cluster"
+	"github.com/rylanq/ryprox/internal/console"
+	"github.com/rylanq/ryprox/internal/crowdsec"
 	"github.com/rylanq/ryprox/internal/health"
 	"github.com/rylanq/ryprox/internal/proxy"
 	"github.com/rylanq/ryprox/internal/secrets"
 	"github.com/rylanq/ryprox/internal/store"
+	"github.com/rylanq/ryprox/internal/tunnel"
 )
 
 // Options configure a RyProx instance. Everything else is set in the UI.
@@ -33,6 +40,11 @@ type Options struct {
 	// Advanced: get certificates from another ACME server instead of Let's Encrypt.
 	ACMEDirectory string
 	ACMECAFile    string
+	Guacd         string // default guacd address (the dashboard setting wins)
+	RelayHost     string // how guacd reaches RyProx, for desktops on a site
+	Follow        string // the primary's sign-in address, to run as a follower
+	FollowToken   string
+	FollowAddress string // optional host:port of the primary's HTTPS listener
 	Log           *slog.Logger
 	UI            fs.FS
 	// Ready, if set, is called once all listeners are open.
@@ -51,6 +63,29 @@ func Run(ctx context.Context, o Options) error {
 	}
 	defer func() { _ = st.Close() }()
 
+	// A follower first copies the primary's configuration and secret key.
+	var follower *cluster.Follower
+	if o.Follow != "" {
+		follower = &cluster.Follower{Primary: o.Follow, Token: o.FollowToken, Address: o.FollowAddress, DataDir: o.DataDir, Store: st, Log: log}
+		for {
+			err := follower.Sync(ctx)
+			if err == nil {
+				break
+			}
+			log.Warn("waiting for the primary", "primary", o.Follow, "err", err)
+			if _, statErr := os.Stat(filepath.Join(o.DataDir, "secret.key")); statErr == nil {
+				log.Warn("starting with the last configuration copied from the primary")
+				break
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(5 * time.Second):
+			}
+		}
+		log.Info("following the primary", "primary", o.Follow)
+	}
+
 	box, err := secrets.LoadOrCreate(filepath.Join(o.DataDir, "secret.key"))
 	if err != nil {
 		return fmt.Errorf("load secret key: %w", err)
@@ -66,7 +101,10 @@ func Run(ctx context.Context, o Options) error {
 		return fmt.Errorf("saved routes are invalid: %w", err)
 	}
 
-	adm := &api.Server{Store: st, Engine: engine, Box: box, Log: log, UI: o.UI, HTTPSPort: portOf(o.HTTPSAddr)}
+	bouncer := crowdsec.New(log)
+	defer bouncer.Close()
+	adm := &api.Server{Store: st, Engine: engine, Box: box, Log: log, UI: o.UI, HTTPSPort: portOf(o.HTTPSAddr), CrowdSec: bouncer,
+		DataDir: o.DataDir, Follower: follower}
 	cm := certs.New(filepath.Join(o.DataDir, "certs"), func(host string) bool {
 		if set := adm.Settings(); host != "" && (host == set.AdminHostname || host == set.AuthHostname) {
 			return true
@@ -74,7 +112,29 @@ func Run(ctx context.Context, o Options) error {
 		return engine.HasHost(host)
 	}, log)
 	adm.Certs = cm
+	if follower != nil {
+		cm.SetFollower(true)
+		follower.Applied = func(certsChanged bool) {
+			if err := adm.Reload(context.Background()); err != nil {
+				log.Error("could not apply the primary's configuration", "err", err)
+			}
+			cm.UseSubdir(follower.CertDir)
+			if certsChanged {
+				cm.Reload()
+			}
+		}
+		follower.LoadCertDir()
+		cm.UseSubdir(follower.CertDir)
+		go follower.Run(ctx)
+	}
 	engine.SetGate(adm) // private routes check every request against the access lists
+	adm.Console = &console.Service{Store: st, Box: box, Log: log, UI: o.UI, DefaultGuacd: o.Guacd, RelayHost: o.RelayHost,
+		Audit: func(r *http.Request, actor, action, detail string) { adm.Audit(r, actor, action, detail) }}
+	engine.SetConsole(adm.Console)
+	hub := tunnel.NewHub(log)
+	adm.Tunnels = hub
+	engine.SetTunnels(hub)
+	adm.Console.Dial = engine.DialTarget
 	if o.ACMEDirectory != "" {
 		if err := cm.UseCustomServer(o.ACMEDirectory, o.ACMECAFile); err != nil {
 			return err
@@ -91,8 +151,13 @@ func Run(ctx context.Context, o Options) error {
 	signInHandler := adm.SignInHandler()
 	httpsPort := portOf(o.HTTPSAddr)
 
+	// Visitors banned by CrowdSec are turned away before anything else.
+	deny := func(w http.ResponseWriter) {
+		proxy.WritePage(w, http.StatusForbidden, "Access blocked", "Your address has been blocked because of suspicious activity.")
+	}
+
 	// Public HTTP: Let's Encrypt challenges, HTTPS redirects, and plain-HTTP routes.
-	httpHandler := cm.HTTPHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	httpHandler := cm.HTTPHandler(bouncer.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		host := proxy.NormalizeHost(r.Host)
 		set := adm.Settings()
 		ownDomain := host != "" && (host == set.AdminHostname || host == set.AuthHostname)
@@ -101,10 +166,15 @@ func Run(ctx context.Context, o Options) error {
 			return
 		}
 		engine.ServeHTTP(w, r)
-	}))
+	}), deny))
+	if follower != nil {
+		// The primary gets the certificates; Let's Encrypt may check any
+		// server behind the name, so pass its challenges on to the primary.
+		httpHandler = forwardChallenges(httpHandler, o.Follow, o.FollowAddress)
+	}
 
 	// Public HTTPS: RyProx's own domains (dashboard, sign-in), else routes.
-	httpsHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	httpsHandler := bouncer.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		host := proxy.NormalizeHost(r.Host)
 		set := adm.Settings()
 		switch {
@@ -115,7 +185,7 @@ func Run(ctx context.Context, o Options) error {
 		default:
 			engine.ServeHTTP(w, r)
 		}
-	})
+	}), deny)
 
 	mux := http.NewServeMux()
 	mux.Handle("/healthz", health.Handler())
@@ -168,7 +238,7 @@ func Run(ctx context.Context, o Options) error {
 	}
 
 	// Request certificates for everything up front.
-	if cm.Enabled() {
+	if cm.Enabled() && follower == nil {
 		if h := adm.Settings().AdminHostname; h != "" {
 			cm.Obtain(h)
 		}
@@ -267,4 +337,30 @@ func displayAddr(a string) string {
 		host = "localhost"
 	}
 	return net.JoinHostPort(host, port)
+}
+
+// forwardChallenges sends ACME HTTP-01 challenges to the primary server.
+func forwardChallenges(next http.Handler, primaryURL, primaryAddr string) http.Handler {
+	host := ""
+	if u, err := url.Parse(primaryURL); err == nil {
+		host = u.Hostname()
+	}
+	if primaryAddr != "" {
+		if h, _, err := net.SplitHostPort(primaryAddr); err == nil {
+			host = h
+		}
+	}
+	target := &url.URL{Scheme: "http", Host: net.JoinHostPort(host, "80")}
+	rp := &httputil.ReverseProxy{Rewrite: func(pr *httputil.ProxyRequest) {
+		pr.SetURL(target)
+		pr.Out.Host = pr.In.Host
+	}, Transport: &http.Transport{Proxy: nil, ResponseHeaderTimeout: 10 * time.Second}}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/.well-known/acme-challenge/") && r.Header.Get("X-RyProx-Forwarded") == "" {
+			r.Header.Set("X-RyProx-Forwarded", "1") // never loop between servers
+			rp.ServeHTTP(w, r)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }

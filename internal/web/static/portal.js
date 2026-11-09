@@ -21,8 +21,8 @@ function h(tag, attrs, ...kids) {
   return el;
 }
 
-async function api(path, body) {
-  const opts = { method: body === undefined ? "GET" : "POST", headers: { "X-RyProx": "1" }, credentials: "same-origin" };
+async function api(path, body, method) {
+  const opts = { method: method || (body === undefined ? "GET" : "POST"), headers: { "X-RyProx": "1" }, credentials: "same-origin" };
   if (body !== undefined) { opts.headers["Content-Type"] = "application/json"; opts.body = JSON.stringify(body); }
   let res;
   try { res = await fetch(BASE + "api/" + path, opts); }
@@ -102,7 +102,32 @@ function loginPage() {
       codePage(r.loginToken);
     } catch (e) { busy(btn, false); showError(form, e); }
   });
-  layout(h("h1", {}, "Sign in"), h("p", { class: "lede" }, "Use your RyProx account."), form);
+  // Passkeys and single sign-on.
+  const extras = [];
+  if (window.RyPasskey?.supported()) {
+    const pk = h("button", { class: "btn", type: "button" }, "Sign in with a passkey");
+    pk.addEventListener("click", async () => {
+      busy(pk, true, "Waiting for your device…");
+      try {
+        const b = await api("login/passkey/begin", {});
+        const cred = await window.RyPasskey.get(b.options);
+        await api(`login/passkey/finish?id=${encodeURIComponent(b.id)}`, cred);
+        state = await api("state");
+        afterSignIn();
+      } catch (e) {
+        busy(pk, false);
+        showError(form, e.status !== undefined ? e : { message: window.RyPasskey.message(e) });
+      }
+    });
+    extras.push(pk);
+  }
+  for (const p of state.sso || []) {
+    const q = new URLSearchParams();
+    if (site) { q.set("site", site); q.set("rd", rd); }
+    extras.push(h("a", { class: "btn", href: `${BASE}sso/${encodeURIComponent(p.id)}/start${q.toString() ? "?" + q : ""}` }, `Continue with ${p.name}`));
+  }
+  layout(h("h1", {}, "Sign in"), h("p", { class: "lede" }, "Use your RyProx account."), form,
+    extras.length ? [h("div", { class: "or" }, h("span", {}, "or")), h("div", { class: "sso-buttons" }, extras)] : null);
   user.focus();
 }
 
@@ -137,7 +162,69 @@ function sitesPage() {
       ? [h("p", { class: "lede" }, "Your sites:"),
          h("ul", { class: "site-list" }, sites.map((s) => h("li", {}, h("a", { href: "https://" + s + "/", class: "mono" }, s))))]
       : h("p", { class: "lede" }, "You haven't been given any sites yet."),
-    h("div", { class: "actions" }, h("a", { class: "btn", href: BASE + "logout" }, "Sign out")));
+    h("div", { class: "actions" }, h("a", { class: "btn", href: BASE + "logout" }, "Sign out")),
+    h("details", { class: "mt-l" }, h("summary", {}, h("b", {}, "Passkeys")),
+      h("p", { class: "muted" }, "Sign in here with your fingerprint, face or device PIN instead of a password and code."), passkeys()),
+    h("details", { class: "mt" }, h("summary", {}, h("b", {}, "Access tokens")),
+      h("p", { class: "muted" }, "For scripts and apps that open your sites without a browser. Send the token as Authorization: Bearer <token>."), tokens()));
+}
+
+function passkeys() {
+  const box = h("div", {});
+  const load = async () => {
+    let r;
+    try { r = await api("passkeys"); } catch { return; }
+    const pw = h("input", { type: "password", autocomplete: "current-password", "data-field": "password" });
+    const name = h("input", { type: "text", "data-field": "name", placeholder: "My phone", maxlength: 60 });
+    const add = h("button", { class: "btn", type: "submit" }, "Add a passkey");
+    const form = h("form", { novalidate: true }, field("Name", name), field("Confirm your password", pw), h("div", { class: "actions" }, add));
+    form.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      if (!window.RyPasskey?.supported()) return showError(form, { message: "This browser doesn't support passkeys." });
+      busy(add, true, "Waiting for your device…");
+      try {
+        const opts = await api("passkeys/begin", { password: pw.value });
+        const cred = await window.RyPasskey.create(opts);
+        await api(`passkeys/finish?name=${encodeURIComponent(name.value || "Passkey")}`, cred);
+        load();
+      } catch (e) { busy(add, false); showError(form, e.status !== undefined ? e : { message: window.RyPasskey.message(e) }); }
+    });
+    box.replaceChildren(
+      h("ul", { class: "plain-list" }, r.passkeys.map((k) => h("li", {}, h("span", {}, k.name),
+        h("button", { class: "btn small", type: "button", onclick: async () => { await api(`passkeys/${k.id}`, undefined, "DELETE").catch(() => {}); load(); } }, "Remove")))),
+      form);
+  };
+  load();
+  return box;
+}
+
+function tokens() {
+  const box = h("div", {});
+  const out = h("div", {});
+  const load = async () => {
+    let r;
+    try { r = await api("tokens"); } catch { return; }
+    const name = h("input", { type: "text", "data-field": "name", placeholder: "Backup script", maxlength: 60 });
+    const exp = h("select", { "data-field": "expiresDays" }, h("option", { value: "30" }, "30 days"), h("option", { value: "90" }, "90 days"),
+      h("option", { value: "365" }, "1 year"), h("option", { value: "0" }, "Never"));
+    const add = h("button", { class: "btn", type: "submit" }, "Create token");
+    const form = h("form", { novalidate: true }, field("Name", name), field("Expires after", exp), h("div", { class: "actions" }, add));
+    form.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      busy(add, true);
+      try {
+        const t = await api("tokens", { name: name.value, scope: "sites", expiresDays: Number(exp.value) });
+        out.replaceChildren(h("div", { class: "banner" }, h("p", {}, h("b", {}, "Copy this token now. "), "It won't be shown again."), h("div", { class: "secret" }, t.token)));
+        load();
+      } catch (e) { busy(add, false); showError(form, e); }
+    });
+    box.replaceChildren(out,
+      h("ul", { class: "plain-list" }, r.tokens.map((t) => h("li", {}, h("span", {}, t.name),
+        h("button", { class: "btn small", type: "button", onclick: async () => { await api(`tokens/${t.id}`, undefined, "DELETE").catch(() => {}); out.replaceChildren(); load(); } }, "Delete")))),
+      form);
+  };
+  load();
+  return box;
 }
 
 function deniedPage() {

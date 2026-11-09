@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -45,6 +46,97 @@ type Manager struct {
 	cacheDir string
 	errs     map[string]hostError
 	pending  map[string]bool
+	follower bool   // certificates come from the primary; never use ACME
+	subdir   string // follower: the primary's certificate folder
+	loaded   map[string]*tls.Certificate
+}
+
+// followerCert serves a certificate synced from the primary, straight from
+// autocert's cache files (host, or host+rsa for older RSA certificates).
+func (c *Manager) followerCert(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+	host := strings.TrimSuffix(strings.ToLower(hello.ServerName), ".")
+	if host == "" || strings.ContainsAny(host, "/\\") || strings.HasPrefix(host, ".") {
+		return nil, errors.New("missing server name")
+	}
+	c.mu.RLock()
+	cert, dir := c.loaded[host], c.cacheDir
+	c.mu.RUnlock()
+	if cert != nil && cert.Leaf != nil && time.Now().Before(cert.Leaf.NotAfter) {
+		return cert, nil
+	}
+	for _, name := range []string{host, host + "+rsa"} {
+		data, err := os.ReadFile(filepath.Join(dir, name)) //nolint:gosec // a host name inside our certificate folder
+		if err != nil {
+			continue
+		}
+		var keyPEM, certPEM []byte
+		for rest := data; ; {
+			var b *pem.Block
+			b, rest = pem.Decode(rest)
+			if b == nil {
+				break
+			}
+			if strings.Contains(b.Type, "PRIVATE KEY") {
+				keyPEM = pem.EncodeToMemory(b)
+			} else {
+				certPEM = append(certPEM, pem.EncodeToMemory(b)...)
+			}
+		}
+		kp, err := tls.X509KeyPair(certPEM, keyPEM)
+		if err != nil {
+			continue
+		}
+		c.mu.Lock()
+		if c.loaded == nil {
+			c.loaded = map[string]*tls.Certificate{}
+		}
+		c.loaded[host] = &kp
+		c.mu.Unlock()
+		return &kp, nil
+	}
+	return nil, fmt.Errorf("no certificate for %q has been copied from the primary yet", host)
+}
+
+// CacheSubdir is the folder (under the certificate directory) in use.
+func (c *Manager) CacheSubdir() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.cacheDir == "" {
+		return ""
+	}
+	return filepath.Base(c.cacheDir)
+}
+
+// UseSubdir makes a follower read certificates from the primary's folder.
+func (c *Manager) UseSubdir(sub string) {
+	if sub == "" || strings.ContainsAny(sub, "/\\.") {
+		return
+	}
+	c.mu.Lock()
+	changed := c.subdir != sub
+	c.subdir = sub
+	c.mu.Unlock()
+	if changed {
+		c.Reload()
+	}
+}
+
+// SetFollower makes the manager serve only certificates synced from the
+// primary server.
+func (c *Manager) SetFollower(on bool) {
+	c.mu.Lock()
+	c.follower = on
+	c.mu.Unlock()
+}
+
+// Reload forgets certificates held in memory, so newly synced files are used.
+func (c *Manager) Reload() {
+	c.mu.Lock()
+	c.m = nil
+	c.loaded = nil
+	s := c.settings
+	c.mu.Unlock()
+	c.Configure(s)
 }
 
 type hostError struct {
@@ -108,12 +200,18 @@ func (c *Manager) Configure(s store.Settings) {
 		// Keep test certificates apart so they're never served in production.
 		sub, dirURL = "letsencrypt-staging", stagingURL
 	}
+	if c.follower && c.subdir != "" {
+		sub = c.subdir
+	}
 	c.cacheDir = filepath.Join(c.dir, sub)
 	c.m = &autocert.Manager{
 		Prompt: autocert.AcceptTOS,
 		Email:  s.ACMEEmail,
 		Cache:  autocert.DirCache(c.cacheDir),
 		HostPolicy: func(_ context.Context, host string) error {
+			if c.follower {
+				return errors.New("this server mirrors the primary, which gets its certificates")
+			}
 			if c.allowed(host) {
 				return nil
 			}
@@ -133,6 +231,12 @@ func (c *Manager) current() *autocert.Manager {
 	return c.m
 }
 
+func (c *Manager) isFollower() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.follower
+}
+
 // Enabled reports whether automatic HTTPS is on.
 func (c *Manager) Enabled() bool { return c.current() != nil }
 
@@ -142,7 +246,13 @@ func (c *Manager) GetCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, 
 	if m == nil {
 		return nil, errors.New("HTTPS is turned off")
 	}
-	cert, err := m.GetCertificate(hello)
+	var cert *tls.Certificate
+	var err error
+	if c.isFollower() {
+		cert, err = c.followerCert(hello)
+	} else {
+		cert, err = m.GetCertificate(hello)
+	}
 	if err != nil && hello.ServerName != "" && c.allowed(hello.ServerName) {
 		c.recordError(hello.ServerName, err)
 	} else if err == nil {

@@ -58,7 +58,7 @@ type Payload struct {
 
 // BuildPayload collects the primary's state.
 func BuildPayload(ctx context.Context, st *store.Store, dataDir, certDir string) (*Payload, error) {
-	key, err := os.ReadFile(filepath.Join(dataDir, "secret.key"))
+	key, err := os.ReadFile(filepath.Join(dataDir, "secret.key")) //nolint:gosec // our own data directory
 	if err != nil {
 		return nil, err
 	}

@@ -644,7 +644,8 @@ func TestRateLimiterWindows(t *testing.T) {
 	now := time.Unix(1_000_000_020, 0)
 	l := newRateLimiter(2)
 	l.now = func() time.Time { return now }
-	if !l.allow("a") || !l.allow("a") || l.allow("a") {
+	first, second, third := l.allow("a"), l.allow("a"), l.allow("a")
+	if !first || !second || third {
 		t.Fatal("first minute")
 	}
 	if !l.allow("b") {

@@ -157,7 +157,7 @@ func Run(ctx context.Context, o Options) error {
 	}
 
 	// Public HTTP: Let's Encrypt challenges, HTTPS redirects, and plain-HTTP routes.
-	var httpHandler http.Handler = cm.HTTPHandler(bouncer.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	httpHandler := cm.HTTPHandler(bouncer.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		host := proxy.NormalizeHost(r.Host)
 		set := adm.Settings()
 		ownDomain := host != "" && (host == set.AdminHostname || host == set.AuthHostname)
@@ -167,6 +167,11 @@ func Run(ctx context.Context, o Options) error {
 		}
 		engine.ServeHTTP(w, r)
 	}), deny))
+	if follower != nil {
+		// The primary gets the certificates; Let's Encrypt may check any
+		// server behind the name, so pass its challenges on to the primary.
+		httpHandler = forwardChallenges(httpHandler, o.Follow, o.FollowAddress)
+	}
 
 	// Public HTTPS: RyProx's own domains (dashboard, sign-in), else routes.
 	httpsHandler := bouncer.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -230,12 +235,6 @@ func Run(ctx context.Context, o Options) error {
 			}
 		}()
 		log.Info("listening", "listener", x.name, "addr", listeners[i].Addr().String())
-	}
-
-	if follower != nil {
-		// The primary gets the certificates; Let's Encrypt may check any
-		// server behind the name, so pass its challenges on to the primary.
-		httpHandler = forwardChallenges(httpHandler, o.Follow, o.FollowAddress)
 	}
 
 	// Request certificates for everything up front.

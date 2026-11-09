@@ -399,7 +399,8 @@ func (s *Server) ssoMatchUser(ctx context.Context, p SSOProvider, subject, email
 		}
 		return u, nil
 	}
-	if email == "" || !(p.TrustEmail || (verified != nil && *verified)) {
+	trusted := p.TrustEmail || (verified != nil && *verified)
+	if email == "" || !trusted {
 		return nil, errors.New("email not verified")
 	}
 	u, err := s.Store.GetUserByEmail(ctx, email)

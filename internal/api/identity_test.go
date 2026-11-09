@@ -196,7 +196,7 @@ func TestActivityExport(t *testing.T) {
 
 // --- single sign-on -------------------------------------------------------
 
-type fakeIdP struct {
+type fakeIDP struct {
 	srv    *httptest.Server
 	key    *rsa.PrivateKey
 	mu     sync.Mutex
@@ -204,9 +204,9 @@ type fakeIdP struct {
 	claims map[string]any    // claims for the next token
 }
 
-func newFakeIdP(t *testing.T) *fakeIdP {
+func newFakeIdP(t *testing.T) *fakeIDP {
 	key, _ := rsa.GenerateKey(rand.Reader, 2048)
-	f := &fakeIdP{key: key, nonces: map[string]string{}}
+	f := &fakeIDP{key: key, nonces: map[string]string{}}
 	mux := http.NewServeMux()
 	f.srv = httptest.NewTLSServer(mux)
 	t.Cleanup(f.srv.Close)
@@ -242,7 +242,7 @@ func newFakeIdP(t *testing.T) *fakeIdP {
 
 // signIn runs the browser side of a provider sign-in and returns the
 // callback response.
-func (f *fakeIdP) signIn(t *testing.T, e *env, claims map[string]any) *httptest.ResponseRecorder {
+func (f *fakeIDP) signIn(t *testing.T, e *env, claims map[string]any) *httptest.ResponseRecorder {
 	t.Helper()
 	start := e.signInPage("GET", "/.ryprox/sso/test/start?site=d.example.com&rd=/x", "", nil, visitor)
 	if start.Code != http.StatusFound {

@@ -41,11 +41,21 @@ const PortalPrefix = "/.ryprox/"
 type Gate interface {
 	// Authorize checks the request's session against the route's access
 	// list. If access is refused it writes the response (a sign-in redirect
-	// or an error) and returns ok=false.
-	Authorize(w http.ResponseWriter, r *http.Request, route *store.Route) (username string, ok bool)
-	// Portal serves RyProx's sign-in pages under PortalPrefix.
+	// or an error) and returns ok=false. On success, stillAllowed re-checks
+	// the same session and is called periodically for long-lived requests
+	// (WebSockets, streams), which are cut off as soon as it returns false.
+	Authorize(w http.ResponseWriter, r *http.Request, route *store.Route) (username string, stillAllowed func() bool, ok bool)
+	// Portal handles requests under PortalPrefix on a private route.
 	Portal(w http.ResponseWriter, r *http.Request, route *store.Route)
 }
+
+// recheckInterval is how often long-lived requests on private routes are
+// re-authorized (nanoseconds; atomic so tests can shorten it).
+var recheckInterval atomic.Int64
+
+func init() { recheckInterval.Store(int64(15 * time.Second)) }
+
+type userKey struct{}
 
 type gateBox struct{ g Gate }
 
@@ -53,10 +63,15 @@ type gateBox struct{ g Gate }
 // every request (fail closed).
 func (e *Engine) SetGate(g Gate) { e.gate.Store(&gateBox{g}) }
 
-// Cookies RyProx uses for sign-in. They are removed before a request is
-// forwarded, so a backend can never see (or steal) a RyProx session.
-var ryproxCookies = map[string]bool{
-	"__Host-ryprox": true, "ryprox": true, "__Host-ryprox-access": true, "ryprox-access": true,
+// IsRyproxCookie reports whether a cookie name belongs to RyProx. These
+// cookies are removed from requests before forwarding, so a backend never
+// sees a RyProx session, and removed from backend responses, so a backend
+// can't set or clear one.
+func IsRyproxCookie(name string) bool {
+	n := strings.ToLower(strings.TrimSpace(name))
+	n = strings.TrimPrefix(n, "__host-")
+	n = strings.TrimPrefix(n, "__secure-")
+	return n == "ryprox" || strings.HasPrefix(n, "ryprox-")
 }
 
 // UserHeader carries the signed-in username to the backend. Any copy sent
@@ -72,7 +87,7 @@ func stripRyproxCookies(h http.Header) {
 	for _, line := range vals {
 		for _, part := range strings.Split(line, ";") {
 			name, _, _ := strings.Cut(strings.TrimSpace(part), "=")
-			if name == "" || ryproxCookies[name] {
+			if name == "" || IsRyproxCookie(name) {
 				continue
 			}
 			kept = append(kept, strings.TrimSpace(part))
@@ -84,10 +99,14 @@ func stripRyproxCookies(h http.Header) {
 	}
 }
 
-func stripRyproxHeaders(h http.Header) {
+// stripUnsafeHeaders removes headers a visitor must not be able to set:
+// RyProx's own X-Ryprox-* headers, and any header containing an underscore.
+// Many backends (CGI, PHP, WSGI, Rack) treat "_" and "-" as the same, so
+// "X_Ryprox_User" would otherwise reach them as X-Ryprox-User.
+func stripUnsafeHeaders(h http.Header) {
 	for name := range h {
-		if strings.HasPrefix(http.CanonicalHeaderKey(name), "X-Ryprox-") {
-			h.Del(name)
+		if strings.Contains(name, "_") || strings.HasPrefix(http.CanonicalHeaderKey(name), "X-Ryprox-") {
+			delete(h, name)
 		}
 	}
 }
@@ -266,10 +285,31 @@ func (lr *liveRoute) rewrite(pr *httputil.ProxyRequest) {
 		pr.Out.Host = pr.In.Host
 	}
 	applyHeaderRules(pr.Out.Header, lr.route.Config.RequestHeaders)
+	// Set the identity header last, on the outgoing request: after hop-by-hop
+	// headers are removed (so "Connection: X-Ryprox-User" can't drop it) and
+	// after header rules (so a rule can't overwrite it).
+	pr.Out.Header.Del(UserHeader)
+	if user, ok := pr.In.Context().Value(userKey{}).(string); ok {
+		pr.Out.Header.Set(UserHeader, user)
+	}
 }
 
 func (lr *liveRoute) modifyResponse(resp *http.Response) error {
 	applyHeaderRules(resp.Header, lr.route.Config.ResponseHeaders)
+	// A backend must not set, replace or clear RyProx's session cookies.
+	if cookies := resp.Header.Values("Set-Cookie"); len(cookies) > 0 {
+		kept := cookies[:0:0]
+		for _, c := range cookies {
+			name, _, _ := strings.Cut(c, "=")
+			if !IsRyproxCookie(name) {
+				kept = append(kept, c)
+			}
+		}
+		resp.Header.Del("Set-Cookie")
+		for _, c := range kept {
+			resp.Header.Add("Set-Cookie", c)
+		}
+	}
 	return nil
 }
 
@@ -321,7 +361,7 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		WritePage(w, http.StatusNotFound, "Not found", "No site is configured at this address.")
 		return
 	}
-	stripRyproxHeaders(r.Header)
+	stripUnsafeHeaders(r.Header)
 	if !lr.route.Config.Access.IsPublic() {
 		gb := e.gate.Load()
 		if gb == nil || gb.g == nil {
@@ -332,11 +372,16 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			gb.g.Portal(w, r, &lr.route)
 			return
 		}
-		user, ok := gb.g.Authorize(w, r, &lr.route)
+		user, stillAllowed, ok := gb.g.Authorize(w, r, &lr.route)
 		if !ok {
 			return
 		}
-		r.Header.Set(UserHeader, user)
+		ctx, cancel := context.WithCancel(context.WithValue(r.Context(), userKey{}, user))
+		defer cancel()
+		if stillAllowed != nil {
+			go watchAccess(ctx, cancel, stillAllowed)
+		}
+		r = r.WithContext(ctx)
 	}
 	stripRyproxCookies(r.Header)
 	if isUpgrade(r) && !lr.route.Config.Websockets {
@@ -344,6 +389,35 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	lr.proxy.ServeHTTP(w, r)
+}
+
+// watchAccess cancels a long-lived request once its session stops being
+// valid. Cancelling the request context closes upgraded (WebSocket)
+// connections and aborts streaming responses.
+func watchAccess(ctx context.Context, cancel context.CancelFunc, stillAllowed func() bool) {
+	t := time.NewTicker(time.Duration(recheckInterval.Load()))
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if !stillAllowed() {
+				cancel()
+				return
+			}
+		}
+	}
+}
+
+// Route returns the live configuration of the enabled route for host.
+func (e *Engine) Route(host string) (*store.Route, bool) {
+	lr, ok := e.snap.Load().routes[host]
+	if !ok {
+		return nil, false
+	}
+	r := lr.route
+	return &r, true
 }
 
 // NormalizeHost lower-cases a Host header and removes any port.

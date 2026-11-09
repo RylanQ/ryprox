@@ -24,8 +24,8 @@ const totpPurpose = "totp-secret"
 // --- first-run setup -------------------------------------------------------
 
 func (s *Server) checkSetupCode(w http.ResponseWriter, r *http.Request, code string) bool {
-	ip := clientIP(r)
-	if ok, wait := s.ipLimit.Check("setup:" + ip); !ok {
+	ip := clientKey(r)
+	if ok, wait := s.ipLimit.Begin("setup:" + ip); !ok {
 		writeError(w, http.StatusTooManyRequests, fmt.Sprintf("too many attempts; try again in %s", wait.Round(time.Second)))
 		return false
 	}
@@ -37,10 +37,10 @@ func (s *Server) checkSetupCode(w http.ResponseWriter, r *http.Request, code str
 		return false
 	}
 	if subtle.ConstantTimeCompare(auth.HashToken(normalizeSetupCode(code)), want) != 1 {
-		s.ipLimit.Fail("setup:" + ip)
 		writeJSON(w, http.StatusForbidden, apiError{Error: "that setup code isn't right; find it in the RyProx logs", Field: "setupCode"})
 		return false
 	}
+	s.ipLimit.Reset("setup:" + ip)
 	return true
 }
 
@@ -121,7 +121,7 @@ func (s *Server) handleSetupFinish(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, err)
 		return
 	}
-	codes, hashes, err := auth.NewRecoveryCodes(10)
+	codes, hashes, err := s.newRecoveryCodes()
 	if err != nil {
 		s.writeErr(w, err)
 		return
@@ -175,20 +175,22 @@ func (s *Server) loginPassword(w http.ResponseWriter, r *http.Request, rl realm)
 		return
 	}
 	ip := clientIP(r)
-	userKey := "user:" + strings.ToLower(strings.TrimSpace(in.Username))
-	ipKey := "ip:" + ip
-	if ok, wait := s.limiter.Check(userKey); !ok {
+	// Limits are per account *and address*, plus per address. Someone guessing
+	// passwords from elsewhere can lock themselves out, but never the real
+	// user (or the local dashboard). Every attempt is counted before the slow
+	// password check, so parallel guesses can't race past the limit.
+	userKey := "user:" + strings.ToLower(strings.TrimSpace(in.Username)) + "|" + clientKey(r)
+	ipKey := "ip:" + clientKey(r)
+	if ok, wait := s.ipLimit.Begin(ipKey); !ok {
 		writeError(w, http.StatusTooManyRequests, fmt.Sprintf("too many failed attempts; try again in %s", wait.Round(time.Second)))
 		return
 	}
-	if ok, wait := s.ipLimit.Check(ipKey); !ok {
+	if ok, wait := s.limiter.Begin(userKey); !ok {
 		writeError(w, http.StatusTooManyRequests, fmt.Sprintf("too many failed attempts; try again in %s", wait.Round(time.Second)))
 		return
 	}
 
 	fail := func() {
-		s.limiter.Fail(userKey)
-		s.ipLimit.Fail(ipKey)
 		s.Log.Warn("failed login", "username", in.Username, "ip", ip, "site", rl.host)
 		// Same message whether the username or password was wrong, or the
 		// account is disabled, so nothing is revealed about which accounts exist.
@@ -245,7 +247,7 @@ func (s *Server) loginVerify(w http.ResponseWriter, r *http.Request, rl realm, a
 		return
 	}
 	userKey := fmt.Sprintf("code:%d", p.userID)
-	if ok, wait := s.limiter.Check(userKey); !ok {
+	if ok, wait := s.limiter.Begin(userKey); !ok {
 		writeError(w, http.StatusTooManyRequests, fmt.Sprintf("too many wrong codes; try again in %s", wait.Round(time.Second)))
 		return
 	}
@@ -258,7 +260,7 @@ func (s *Server) loginVerify(w http.ResponseWriter, r *http.Request, rl realm, a
 	valid, method := false, "authenticator code"
 	if auth.LooksLikeRecoveryCode(in.Code) {
 		method = "recovery code"
-		valid, err = s.Store.ConsumeRecoveryCode(r.Context(), u.ID, auth.HashRecoveryCode(in.Code))
+		valid, err = s.consumeRecoveryCode(r, u.ID, in.Code)
 		if err != nil {
 			s.writeErr(w, err)
 			return
@@ -279,7 +281,6 @@ func (s *Server) loginVerify(w http.ResponseWriter, r *http.Request, rl realm, a
 		}
 	}
 	if !valid {
-		s.limiter.Fail(userKey)
 		s.Log.Warn("wrong two-factor code", "username", u.Username, "ip", clientIP(r), "site", rl.host)
 		writeJSON(w, http.StatusUnauthorized, apiError{Error: "that code isn't right", Field: "code"})
 		return
@@ -289,8 +290,8 @@ func (s *Server) loginVerify(w http.ResponseWriter, r *http.Request, rl realm, a
 	delete(s.pending, key)
 	s.mu.Unlock()
 	s.limiter.Reset(userKey)
-	s.limiter.Reset("user:" + strings.ToLower(u.Username))
-	s.ipLimit.Reset("ip:" + clientIP(r))
+	s.limiter.Reset("user:" + strings.ToLower(u.Username) + "|" + clientKey(r))
+	s.ipLimit.Reset("ip:" + clientKey(r))
 
 	where := "the dashboard"
 	if rl.host != "" {
@@ -334,12 +335,11 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request, u 
 		return
 	}
 	key := fmt.Sprintf("pw:%d", u.ID)
-	if ok, wait := s.limiter.Check(key); !ok {
+	if ok, wait := s.limiter.Begin(key); !ok {
 		writeError(w, http.StatusTooManyRequests, fmt.Sprintf("too many attempts; try again in %s", wait.Round(time.Second)))
 		return
 	}
 	if ok, _ := auth.VerifyPassword(r.Context(), in.Current, u.PasswordHash); !ok {
-		s.limiter.Fail(key)
 		writeJSON(w, http.StatusBadRequest, apiError{Error: "current password is wrong", Field: "current"})
 		return
 	}
@@ -415,16 +415,16 @@ func (s *Server) handleNewRecoveryCodes(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 	key := fmt.Sprintf("pw:%d", u.ID)
-	if ok, wait := s.limiter.Check(key); !ok {
+	if ok, wait := s.limiter.Begin(key); !ok {
 		writeError(w, http.StatusTooManyRequests, fmt.Sprintf("too many attempts; try again in %s", wait.Round(time.Second)))
 		return
 	}
 	if ok, _ := auth.VerifyPassword(r.Context(), in.Password, u.PasswordHash); !ok {
-		s.limiter.Fail(key)
 		writeJSON(w, http.StatusBadRequest, apiError{Error: "password is wrong", Field: "password"})
 		return
 	}
-	codes, hashes, err := auth.NewRecoveryCodes(10)
+	s.limiter.Reset(key)
+	codes, hashes, err := s.newRecoveryCodes()
 	if err != nil {
 		s.writeErr(w, err)
 		return
@@ -435,4 +435,28 @@ func (s *Server) handleNewRecoveryCodes(w http.ResponseWriter, r *http.Request, 
 	}
 	s.audit(r, u.Username, "account.recovery_codes", "new recovery codes generated")
 	writeJSON(w, http.StatusOK, map[string]any{"recoveryCodes": codes})
+}
+
+// newRecoveryCodes makes ten recovery codes and their keyed hashes. The
+// hashes use secret.key, so a copy of the database alone can't be used to
+// search for the codes.
+func (s *Server) newRecoveryCodes() (codes, hashes []string, err error) {
+	codes, _, err = auth.NewRecoveryCodes(10)
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, c := range codes {
+		hashes = append(hashes, s.Box.MAC("recovery-code", auth.NormalizeRecoveryCode(c)))
+	}
+	return codes, hashes, nil
+}
+
+// consumeRecoveryCode uses up a recovery code if it is valid. Codes made
+// before keyed hashes were introduced are still accepted.
+func (s *Server) consumeRecoveryCode(r *http.Request, userID int64, code string) (bool, error) {
+	ok, err := s.Store.ConsumeRecoveryCode(r.Context(), userID, s.Box.MAC("recovery-code", auth.NormalizeRecoveryCode(code)))
+	if err != nil || ok {
+		return ok, err
+	}
+	return s.Store.ConsumeRecoveryCode(r.Context(), userID, auth.HashRecoveryCode(code))
 }

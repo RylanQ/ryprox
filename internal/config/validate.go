@@ -250,6 +250,16 @@ func NormalizeSettings(s *store.Settings) error {
 	default:
 		return fieldErr("tlsMode", "choose automatic HTTPS or HTTP only")
 	}
+	if s.AuthHostname != "" {
+		if s.TLSMode != store.TLSModeACME {
+			return fieldErr("authHostname", "a sign-in domain needs automatic HTTPS, so passwords are never sent unencrypted")
+		}
+		h, err := NormalizeHostname("authHostname", s.AuthHostname)
+		if err != nil {
+			return err
+		}
+		s.AuthHostname = h
+	}
 	if s.AdminHostname != "" {
 		if s.TLSMode != store.TLSModeACME {
 			return fieldErr("adminHostname", "the admin dashboard can only be put on a domain when automatic HTTPS is on, so your password is never sent unencrypted")
@@ -264,11 +274,14 @@ func NormalizeSettings(s *store.Settings) error {
 }
 
 // CheckRoutes validates the whole route set, including rules that span
-// routes (like the admin hostname not being used by a route).
-func CheckRoutes(routes []store.Route, adminHostname string) error {
+// routes (like RyProx's own domains not being used by a route).
+func CheckRoutes(routes []store.Route, s store.Settings) error {
 	for _, r := range routes {
-		if adminHostname != "" && r.Hostname == adminHostname {
-			return fieldErr("hostname", "%s is used for the RyProx admin dashboard", r.Hostname)
+		if s.AdminHostname != "" && r.Hostname == s.AdminHostname {
+			return fieldErr("hostname", "%s is used for the RyProx dashboard", r.Hostname)
+		}
+		if s.AuthHostname != "" && r.Hostname == s.AuthHostname {
+			return fieldErr("hostname", "%s is used for RyProx's sign-in page", r.Hostname)
 		}
 	}
 	return nil

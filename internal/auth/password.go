@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"golang.org/x/crypto/argon2"
@@ -40,11 +41,18 @@ var hashSlots = make(chan struct{}, 4)
 // ErrBusy is returned when the server is too busy to check a password.
 var ErrBusy = errors.New("too many login attempts in progress, try again shortly")
 
+// hashWait is how long a password check may wait for a free slot.
+const hashWait = 5 * time.Second
+
 func acquire(ctx context.Context) error {
+	t := time.NewTimer(hashWait)
+	defer t.Stop()
 	select {
 	case hashSlots <- struct{}{}:
 		return nil
 	case <-ctx.Done():
+		return ErrBusy
+	case <-t.C:
 		return ErrBusy
 	}
 }

@@ -1,5 +1,6 @@
-// RyProx sign-in portal, shown on private sites under /.ryprox/.
-// Same safety rule as the dashboard: server text only ever goes into textContent.
+// RyProx sign-in page. Served only on RyProx's sign-in domain (and the local
+// dashboard, for accepting invites), never on a route's own domain.
+// Server text is only ever placed with textContent.
 "use strict";
 
 const BASE = "/.ryprox/";
@@ -27,21 +28,14 @@ async function api(path, body) {
   try { res = await fetch(BASE + "api/" + path, opts); }
   catch { throw Object.assign(new Error("Can't reach the server. Check your connection."), { status: 0 }); }
   const data = res.headers.get("Content-Type")?.includes("json") ? await res.json() : null;
-  if (!res.ok) throw Object.assign(new Error((data && data.error) || `Request failed (${res.status})`), { status: res.status, field: data && data.field });
+  if (!res.ok) throw Object.assign(new Error((data && data.error) || `Request failed (${res.status})`), { status: res.status, field: data && data.field, denied: data && data.denied });
   return data;
 }
 
 const cap = (s) => (s ? s[0].toUpperCase() + s.slice(1) : s);
-
-// Only ever return to a page on this same site, never to another website.
-function safeReturn() {
-  const rd = new URLSearchParams(location.search).get("rd") || "/";
-  try {
-    const u = new URL(rd, location.origin);
-    if (u.origin !== location.origin || !rd.startsWith("/") || rd.startsWith("//") || rd.includes("\\") || u.pathname.startsWith(BASE)) return "/";
-    return u.pathname + u.search + u.hash;
-  } catch { return "/"; }
-}
+const params = new URLSearchParams(location.search);
+const site = params.get("site") || "";
+const rd = params.get("rd") || "/";
 
 function field(label, input, hint) {
   input.id ||= "f" + Math.random().toString(36).slice(2);
@@ -65,18 +59,34 @@ function busy(btn, on, label) {
 let state = {};
 
 function layout(...content) {
-  const site = state.site || location.hostname;
   document.getElementById("app").replaceChildren(h("div", { class: "auth" },
     h("div", { class: "auth-art", "aria-hidden": "true" },
       h("div", { class: "brand" }, "RyProx"),
       h("div", { class: "art" },
         h("div", { class: "wire", "data-state": "up" }),
         h("div", { class: "wire", "data-state": "off" })),
-      h("blockquote", {}, "This site is private. Only people who've been given access can open it.")),
+      h("blockquote", {}, "Sign in once here to open the private sites you've been given.")),
     h("div", { class: "auth-main" }, h("div", { class: "auth-card" },
       state.secure === false ? h("div", { class: "banner error" }, "This page isn't using HTTPS, so signing in is turned off to protect your password.") : null,
-      h("p", { class: "muted mono" }, site),
+      site ? h("p", { class: "muted mono" }, `Signing in to ${site}`) : null,
       ...content))));
+}
+
+// Ask for a one-time code for the site and go there.
+async function continueToSite() {
+  try {
+    const r = await api("continue", { site, rd });
+    location.replace(r.url);
+  } catch (e) {
+    if (e.denied) return deniedPage();
+    if (e.status === 401) return loginPage();
+    layout(h("h1", {}, "Can't open this site"), h("p", { class: "lede" }, cap(e.message)));
+  }
+}
+
+function afterSignIn() {
+  if (site) return continueToSite();
+  return sitesPage();
 }
 
 function loginPage() {
@@ -92,7 +102,7 @@ function loginPage() {
       codePage(r.loginToken);
     } catch (e) { busy(btn, false); showError(form, e); }
   });
-  layout(h("h1", {}, "Sign in"), h("p", { class: "lede" }, "Use your RyProx account to open this site."), form);
+  layout(h("h1", {}, "Sign in"), h("p", { class: "lede" }, "Use your RyProx account."), form);
   user.focus();
 }
 
@@ -107,7 +117,8 @@ function codePage(token) {
     busy(btn, true, "Verifying…");
     try {
       await api("login/verify", { loginToken: token, code: code.value });
-      location.replace(safeReturn());
+      state = await api("state");
+      afterSignIn();
     } catch (e) {
       busy(btn, false);
       if (e.status === 401 && !e.field) return loginPage();
@@ -119,15 +130,26 @@ function codePage(token) {
   code.focus();
 }
 
+function sitesPage() {
+  const sites = state.sites || [];
+  layout(h("h1", {}, `Signed in as ${state.user}`),
+    sites.length
+      ? [h("p", { class: "lede" }, "Your sites:"),
+         h("ul", { class: "site-list" }, sites.map((s) => h("li", {}, h("a", { href: "https://" + s + "/", class: "mono" }, s))))]
+      : h("p", { class: "lede" }, "You haven't been given any sites yet."),
+    h("div", { class: "actions" }, h("a", { class: "btn", href: BASE + "logout" }, "Sign out")));
+}
+
 function deniedPage() {
   layout(h("h1", {}, "No access"),
-    h("p", { class: "lede" }, `You're signed in as ${state.user || "someone"}, but this account hasn't been given access to this site. Ask whoever runs it to add you.`),
+    h("p", { class: "lede" }, `You're signed in as ${state.user || "someone"}, but this account hasn't been given access to ${site || "this site"}. Ask whoever runs it to add you.`),
     h("div", { class: "actions" }, h("a", { class: "btn", href: BASE + "logout" }, "Sign in as someone else")));
 }
 
 async function logoutPage() {
   try { await api("logout", {}); } catch { /* signed out anyway */ }
-  layout(h("h1", {}, "Signed out"), h("p", { class: "lede" }, "You've been signed out of this site."),
+  state.user = null;
+  layout(h("h1", {}, "Signed out"), h("p", { class: "lede" }, "You've been signed out."),
     h("div", { class: "actions" }, h("a", { class: "btn primary", href: BASE + "login" }, "Sign in")));
 }
 
@@ -137,9 +159,7 @@ async function invitePage() {
   history.replaceState(null, "", location.pathname);
   let inv;
   try { inv = await api("invite/begin", { token }); }
-  catch (e) {
-    return layout(h("h1", {}, "Invite not valid"), h("p", { class: "lede" }, cap(e.message)));
-  }
+  catch (e) { return layout(h("h1", {}, "Invite not valid"), h("p", { class: "lede" }, cap(e.message))); }
   const pass = h("input", { type: "password", autocomplete: "new-password", "data-field": "password", minlength: 12 });
   const code = h("input", { type: "text", inputmode: "numeric", autocomplete: "one-time-code", "data-field": "totpCode", maxlength: 6 });
   const btn = h("button", { class: "btn primary", type: "submit" }, "Create account");
@@ -166,10 +186,10 @@ async function invitePage() {
 
 function codesPage(r) {
   const text = "RyProx recovery codes\nEach code works once if you lose your authenticator.\n\n" + r.recoveryCodes.join("\n") + "\n";
-  const done = h("button", { class: "btn primary", type: "button", disabled: true, onclick: () => {
-    if (r.signedIn) location.replace("/");
-    else layout(h("h1", {}, "Your account is ready"), h("p", { class: "lede" }, "Open any site you've been given and sign in with your username, password and authenticator code."));
-  } }, r.signedIn ? "Open the site" : "Done");
+  const done = h("button", { class: "btn primary", type: "button", disabled: true, onclick: async () => {
+    if (r.signedIn) { state = await api("state"); return sitesPage(); }
+    layout(h("h1", {}, "Your account is ready"), h("p", { class: "lede" }, "Open any site you've been given and sign in with your username, password and authenticator code."));
+  } }, "Continue");
   const saved = h("input", { type: "checkbox" });
   saved.addEventListener("change", () => { done.disabled = !saved.checked; });
   const dl = h("button", { class: "btn", type: "button", onclick: () => {
@@ -189,9 +209,11 @@ async function boot() {
   const page = location.pathname.slice(BASE.length).replace(/\/$/, "");
   if (page === "invite") return invitePage();
   if (page === "logout") return logoutPage();
+  if (!state.signInDomain) {
+    return layout(h("h1", {}, "Sign in on your site"), h("p", { class: "lede" }, "Open the site you want to use; it will send you to the right sign-in page."));
+  }
   if (page === "denied") return state.user ? deniedPage() : loginPage();
-  if (state.user && state.allowed) return location.replace(safeReturn());
-  if (state.user && !state.allowed) return deniedPage();
+  if (state.user) return afterSignIn();
   loginPage();
 }
 

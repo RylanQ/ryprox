@@ -173,3 +173,20 @@ func TestLimiter(t *testing.T) {
 		t.Fatal("old failures not forgotten")
 	}
 }
+
+func TestLimiterBeginCountsEveryAttempt(t *testing.T) {
+	l := NewLimiter()
+	allowed := 0
+	for range 50 {
+		if ok, _ := l.Begin("k"); ok {
+			allowed++
+		}
+	}
+	if allowed != 6 {
+		t.Fatalf("%d attempts allowed before lockout, want 6", allowed)
+	}
+	l.Reset("k")
+	if ok, _ := l.Begin("k"); !ok {
+		t.Fatal("reset did not unlock")
+	}
+}

@@ -535,9 +535,10 @@ async function routeEditor(id) {
     "Anyone on the internet can open this site, without signing in. Only choose this for things meant to be public, and make sure the app has its own login.");
   peopleList.addEventListener("change", syncPeople);
   const invitePeople = h("p", { class: "muted mt" }, "Need someone else? ", h("a", { href: "#/people" }, "Invite them on the People page"), ".");
-  const httpsNote = settings.tlsMode === "acme" ? null : h("div", { class: "warn-inline flush" },
-    "HTTPS is off, so people can't sign in from other devices yet (RyProx never accepts passwords over plain HTTP). ",
-    h("a", { href: "#/settings" }, "Turn on automatic HTTPS"), ".");
+  const signInReady = settings.tlsMode === "acme" && (settings.authHostname || settings.adminHostname);
+  const httpsNote = signInReady ? null : h("div", { class: "warn-inline flush" },
+    "Nobody can sign in to private sites yet: they need automatic HTTPS and a sign-in domain. ",
+    h("a", { href: "#/settings" }, "Set them up in Settings"), ".");
 
   // Targets
   const tlist = h("div", { class: "target-list" });
@@ -774,10 +775,12 @@ async function settingsPage() {
   const email = h("input", { type: "email", "data-field": "acmeEmail", value: s.acmeEmail, autocomplete: "email" });
   const staging = toggle("Use test certificates", "Recommended while you try things out. Browsers show a warning, but you won't hit Let's Encrypt's limits.", s.acmeStaging);
   const admin = h("input", { type: "text", "data-field": "adminHostname", value: s.adminHostname, placeholder: "ryprox.example.com", class: "mono", spellcheck: "false", autocapitalize: "off" });
+  const signin = h("input", { type: "text", "data-field": "authHostname", value: s.authHostname || "", placeholder: "login.example.com", class: "mono", spellcheck: "false", autocapitalize: "off" });
   const acmeBits = h("div", { hidden: s.tlsMode !== "acme" },
     field("Email for Let's Encrypt", email, "Used only for certificate expiry warnings."),
     staging,
-    field("Admin dashboard domain (optional)", admin, "Open this dashboard securely at its own domain. Leave empty to only use it from this server."));
+    field("Sign-in domain", signin, "Where people sign in to open private sites, e.g. login.example.com. Needs its own DNS record."),
+    field("Dashboard domain (optional)", admin, "Open this dashboard at its own domain. Leave empty to only use it from this server. If no sign-in domain is set, people sign in here."));
   const sync = () => { acmeBits.hidden = !modeAuto.checked; };
   modeAuto.addEventListener("change", sync); modeOff.addEventListener("change", sync);
   const saveHttps = h("button", { class: "btn primary", type: "submit" }, "Save HTTPS settings");
@@ -794,7 +797,7 @@ async function settingsPage() {
     try {
       await api("PUT", "/api/settings", {
         tlsMode: modeAuto.checked ? "acme" : "off", acmeEmail: email.value,
-        acmeStaging: staging.querySelector("input").checked, adminHostname: admin.value,
+        acmeStaging: staging.querySelector("input").checked, adminHostname: admin.value, authHostname: signin.value,
       });
       toast(modeAuto.checked ? "Saved. Certificates are being requested." : "Saved.");
     } catch (e) { showError(httpsForm, e); }
@@ -924,7 +927,7 @@ async function peoplePage() {
           h("div", { class: "row" }, h("input", { type: "text", readonly: true, value: link, class: "mono", "aria-label": "Invite link", onfocus: (e) => e.target.select() }),
             h("button", { class: "btn", type: "button", onclick: () => copy(link) }, "Copy")),
           r.https ? null : h("p", { class: "warn-inline flush0" },
-            "This link only works from this computer, because there's no HTTPS address yet. Turn on automatic HTTPS and add an admin domain or a private site, then create a new invite.")));
+            "This link only works from this computer, because there's no sign-in domain yet. Turn on automatic HTTPS and set a sign-in domain in Settings, then create a new invite.")));
         name.value = "";
         sites.querySelectorAll("input").forEach((i) => { i.checked = false; });
         loadLists();

@@ -207,10 +207,11 @@ func initCmd(args []string, stdout, stderr io.Writer) error {
 	email := fs.String("acme-email", "", "email for Let's Encrypt; turns on automatic HTTPS")
 	staging := fs.Bool("acme-staging", false, "use Let's Encrypt test certificates")
 	adminDomain := fs.String("admin-domain", "", "serve the dashboard on this domain over HTTPS (needs --acme-email)")
+	authDomain := fs.String("auth-domain", "", "where people sign in to private sites (needs --acme-email)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	st := store.Settings{TLSMode: store.TLSModeOff, AdminHostname: *adminDomain}
+	st := store.Settings{TLSMode: store.TLSModeOff, AdminHostname: *adminDomain, AuthHostname: *authDomain}
 	if *email != "" {
 		st.TLSMode, st.ACMEEmail, st.ACMEStaging = store.TLSModeACME, *email, *staging
 	}
@@ -238,6 +239,9 @@ func initCmd(args []string, stdout, stderr io.Writer) error {
 		}
 	}
 	_, _ = fmt.Fprintf(stdout, "Saved: %s", mode)
+	if st.AuthHostname != "" {
+		_, _ = fmt.Fprintf(stdout, ", sign-in at https://%s", st.AuthHostname)
+	}
 	if st.AdminHostname != "" {
 		_, _ = fmt.Fprintf(stdout, ", dashboard at https://%s", st.AdminHostname)
 	}

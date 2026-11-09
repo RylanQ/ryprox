@@ -28,10 +28,11 @@ import (
 
 // Session lifetimes.
 const (
-	sessionIdle     = 12 * time.Hour
-	sessionAbsolute = 7 * 24 * time.Hour
-	pendingLoginTTL = 5 * time.Minute
-	maxBodyBytes    = 1 << 20
+	sessionIdle      = 12 * time.Hour
+	localSessionIdle = time.Hour // dashboard over plain HTTP: cookies on localhost are shared with every port
+	sessionAbsolute  = 7 * 24 * time.Hour
+	pendingLoginTTL  = 5 * time.Minute
+	maxBodyBytes     = 1 << 20
 )
 
 // Server is the admin API and UI.
@@ -43,14 +44,18 @@ type Server struct {
 	Log    *slog.Logger
 	UI     fs.FS // the web/static directory
 
+	// HTTPSPort is the public HTTPS port, used to build links to sites.
+	HTTPSPort string
+
 	settings atomic.Pointer[store.Settings]
 
-	limiter *auth.Limiter // per username
-	ipLimit *auth.Limiter // per client IP
+	limiter *auth.Limiter // per account (and per account + address)
+	ipLimit *auth.Limiter // per client address
 
 	mu        sync.Mutex
 	setupHash []byte // hash of the one-time setup code; nil once set up
 	pending   map[string]pendingLogin
+	handoffs  map[string]handoff // one-time codes that sign a visitor in to a site
 
 	portalOnce sync.Once
 	portal     http.Handler
@@ -69,6 +74,7 @@ func New(ctx context.Context, s *Server) (setupCode string, err error) {
 	s.limiter = auth.NewLimiter()
 	s.ipLimit = auth.NewLimiter()
 	s.pending = map[string]pendingLogin{}
+	s.handoffs = map[string]handoff{}
 	st, err := s.Store.GetSettings(ctx)
 	if err != nil {
 		return "", err
@@ -156,7 +162,7 @@ func (s *Server) Handler() http.Handler {
 		files.ServeHTTP(w, r)
 	}))
 
-	return s.securityHeaders(s.csrfProtect(mux))
+	return s.securityHeaders(s.restrictHosts(s.csrfProtect(s.requireSecurePost(mux))))
 }
 
 // securityHeaders hardens every admin response against common attacks.
@@ -268,7 +274,11 @@ func (s *Server) sessionFor(r *http.Request, rl realm) (*store.User, *store.Sess
 		return nil, nil
 	}
 	now := time.Now()
-	if now.After(sess.ExpiresAt) || now.Sub(sess.LastSeenAt) > sessionIdle {
+	idle := sessionIdle
+	if rl == dashboard && r.TLS == nil {
+		idle = localSessionIdle
+	}
+	if now.After(sess.ExpiresAt) || now.Sub(sess.LastSeenAt) > idle {
 		_ = s.Store.DeleteSession(ctx, sess.UserID, sess.ID)
 		return nil, nil
 	}
@@ -331,6 +341,55 @@ func (s *Server) Cleanup(ctx context.Context) {
 			delete(s.pending, k)
 		}
 	}
+	for k, h := range s.handoffs {
+		if time.Now().After(h.expires) {
+			delete(s.handoffs, k)
+		}
+	}
+}
+
+// restrictHosts only answers requests addressed to RyProx itself: localhost
+// (directly or through an SSH tunnel), or RyProx's own domains. This blocks
+// DNS-rebinding attacks from web pages the admin visits.
+func (s *Server) restrictHosts(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host := proxy.NormalizeHost(r.Host)
+		st := s.Settings()
+		switch {
+		case openedAsLocalhost(r):
+		case r.TLS != nil && host != "" && (host == st.AdminHostname || host == st.SignInHostname()):
+		default:
+			http.Error(w, "unknown host", http.StatusMisdirectedRequest)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// requireSecurePost refuses passwords and other changes over plain HTTP,
+// except from this machine (locally or through an SSH tunnel).
+func (s *Server) requireSecurePost(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead && r.TLS == nil && !s.isLocal(r) {
+			writeError(w, http.StatusForbidden, "this needs HTTPS; open RyProx through an SSH tunnel or its HTTPS domain")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// isLocal reports whether a plain-HTTP request comes from this machine: the
+// browser addressed localhost, and the connection comes from loopback or,
+// inside a container, from the host (the default gateway).
+func (s *Server) isLocal(r *http.Request) bool {
+	if !openedAsLocalhost(r) {
+		return false
+	}
+	if isLoopback(r) {
+		return true
+	}
+	gw := defaultGateway()
+	return gw != nil && gw.Equal(net.ParseIP(clientIP(r)))
 }
 
 // --- helpers -------------------------------------------------------------
@@ -343,6 +402,19 @@ func clientIP(r *http.Request) string {
 		return r.RemoteAddr
 	}
 	return host
+}
+
+// clientKey identifies a client for rate limiting: its IPv4 address, or its
+// IPv6 /64 network (one user usually controls a whole /64).
+func clientKey(r *http.Request) string {
+	ip := net.ParseIP(clientIP(r))
+	if ip == nil {
+		return clientIP(r)
+	}
+	if v4 := ip.To4(); v4 != nil {
+		return v4.String()
+	}
+	return ip.Mask(net.CIDRMask(64, 128)).String() + "/64"
 }
 
 func isLoopback(r *http.Request) bool {
@@ -430,7 +502,7 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		"setupRequired": setup,
 		"version":       version.Version,
 		// Warn when the dashboard is used over plain HTTP from another machine.
-		"insecure": r.TLS == nil && !isLoopback(r) && !openedAsLocalhost(r),
+		"insecure": r.TLS == nil && !s.isLocal(r),
 	}
 	if u, _ := s.currentSession(r); u != nil {
 		out["user"] = map[string]any{"username": u.Username}

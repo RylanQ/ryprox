@@ -204,7 +204,7 @@ type fakeIDP struct {
 	claims map[string]any    // claims for the next token
 }
 
-func newFakeIdP(t *testing.T) *fakeIDP {
+func newFakeIDP(t *testing.T) *fakeIDP {
 	key, _ := rsa.GenerateKey(rand.Reader, 2048)
 	f := &fakeIDP{key: key, nonces: map[string]string{}}
 	mux := http.NewServeMux()
@@ -276,7 +276,7 @@ func TestSSO(t *testing.T) {
 	admin := e.client()
 	e.setup(admin)
 	e.enableSignIn()
-	idp := newFakeIdP(t)
+	idp := newFakeIDP(t)
 	e.srv.HTTPClient = idp.srv.Client()
 	code, out := admin.req("PUT", "/api/sso", map[string]any{"providers": []map[string]any{{"id": "test", "name": "Test",
 		"issuer": idp.srv.URL, "clientId": "ryprox", "clientSecret": "s3cret"}}}, nil)
@@ -322,7 +322,7 @@ func TestSSOStateBoundToBrowser(t *testing.T) {
 	admin := e.client()
 	e.setup(admin)
 	e.enableSignIn()
-	idp := newFakeIdP(t)
+	idp := newFakeIDP(t)
 	e.srv.HTTPClient = idp.srv.Client()
 	admin.req("PUT", "/api/sso", map[string]any{"providers": []map[string]any{{"id": "test", "name": "Test",
 		"issuer": idp.srv.URL, "clientId": "ryprox", "clientSecret": "s3cret", "trustEmail": true}}}, nil)

@@ -233,7 +233,10 @@ type Agent struct {
 	Server string   // RyProx's sign-in address, e.g. https://login.example.com
 	Token  string   // the site's token
 	Allow  []string // CIDRs or host names the agent may connect to; empty means any
-	Log    *slog.Logger
+	// Address, if set, is the host:port to connect to instead of looking up
+	// Server's name (to reach one particular server of several).
+	Address string
+	Log     *slog.Logger
 	// HTTPClient is used for the WebSocket (tests use a client that trusts a test CA).
 	HTTPClient *http.Client
 }
@@ -272,7 +275,14 @@ func (a *Agent) once(ctx context.Context, allow *allowList) error {
 	}
 	h := http.Header{}
 	h.Set("Authorization", "Bearer "+a.Token)
-	c, resp, err := websocket.Dial(ctx, u, &websocket.DialOptions{HTTPHeader: h, HTTPClient: a.HTTPClient, Subprotocols: []string{"ryprox-tunnel"}})
+	client := a.HTTPClient
+	if client == nil && a.Address != "" {
+		addr := a.Address
+		client = &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return (&net.Dialer{Timeout: 10 * time.Second}).DialContext(ctx, network, addr)
+		}}}
+	}
+	c, resp, err := websocket.Dial(ctx, u, &websocket.DialOptions{HTTPHeader: h, HTTPClient: client, Subprotocols: []string{"ryprox-tunnel"}})
 	if resp != nil && resp.Body != nil {
 		_ = resp.Body.Close()
 	}

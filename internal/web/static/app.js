@@ -174,6 +174,7 @@ async function boot() {
     state.setupRequired = s.setupRequired;
     state.user = s.user || null;
     state.insecure = s.insecure;
+    state.follower = s.follower || null;
     state.version = s.version;
   } catch (e) {
     mount(h("main", {}, h("div", { class: "banner error" }, e.message)));
@@ -205,6 +206,9 @@ function shell(current, ...content) {
     state.insecure ? h("div", { class: "banner", role: "note" },
       "You're using the dashboard over an unencrypted connection from another computer. " +
       "Use an SSH tunnel, or set an admin domain under Settings so your password is protected.") : null,
+    state.follower ? h("div", { class: "banner", role: "note" },
+      h("b", {}, "This server mirrors "), h("span", { class: "mono" }, state.follower.primary), ". Changes are made there and copied here every few seconds.",
+      state.follower.error ? h("div", { class: "err" }, "Last sync failed: " + state.follower.error) : null) : null,
     ...content);
   mount(h("div", { class: "shell" },
     h("aside", { class: "side" },
@@ -1049,6 +1053,7 @@ async function settingsPage() {
   };
 
   const csBox = crowdsecEditor();
+  const nodesBox = nodesEditor();
   const rdBox = remoteEditor();
   const pkBox = passkeysBox("/api/account/passkeys");
   const tokBox = tokensBox("/api/account/tokens", true);
@@ -1057,6 +1062,8 @@ async function settingsPage() {
   shell("settings",
     h("div", { class: "page-head" }, h("div", {}, h("h1", {}, "Settings"))),
     h("section", { class: "section" }, h("header", {}, h("h2", {}, "HTTPS")), httpsForm),
+    h("section", { class: "section" }, h("header", {}, h("h2", {}, "Servers"),
+      h("p", {}, "Run RyProx on more than one server. Followers copy this server's configuration and certificates and keep serving if it goes down.")), nodesBox),
     h("section", { class: "section" }, h("header", {}, h("h2", {}, "Terminals and remote desktops"),
       h("p", {}, "SSH works out of the box. Windows (RDP) and Mac/VNC desktops go through guacd, Apache Guacamole's connection service, which runs next to RyProx.")), rdBox),
     h("section", { class: "section" }, h("header", {}, h("h2", {}, "CrowdSec"),
@@ -1151,6 +1158,53 @@ function tokensBox(base, allowAdmin) {
           if (!(await confirmDialog("Delete this token?", `Anything using "${t.name}" will stop working.`, "Delete"))) return;
           try { await api("DELETE", `${base}/${t.id}`); toast("Token deleted."); out.replaceChildren(); load(); } catch (e) { toast(e.message, "error"); }
         } }, "Delete")))) : h("p", { class: "muted" }, "No tokens yet."),
+      form);
+  };
+  load();
+  return box;
+}
+
+function nodesEditor() {
+  const box = h("div", {});
+  const out = h("div", {});
+  const load = async () => {
+    let r;
+    try { r = await api("GET", "/api/nodes"); } catch { return; }
+    if (r.follower) {
+      box.replaceChildren(h("p", {}, "This server is a follower of ", h("span", { class: "mono" }, r.follower.primary), ". ",
+        r.follower.lastSync && !r.follower.lastSync.startsWith("0001") ? `Last copied ${ago(r.follower.lastSync)}.` : ""),
+        h("p", { class: "muted" }, "To make it the primary, restart it without RYPROX_FOLLOW."));
+      return;
+    }
+    const name = h("input", { type: "text", "data-field": "name", placeholder: "backup", maxlength: 60 });
+    const add = h("button", { class: "btn", type: "submit" }, "Add server");
+    const form = h("form", { novalidate: true, class: "mt" }, field("Name", name), h("div", { class: "actions" }, add));
+    form.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      clearErrors(form);
+      busy(add, true);
+      try {
+        const n = await api("POST", "/api/nodes", { name: name.value });
+        const primary = n.primary || "https://<your sign-in domain>";
+        const cmd = `curl -fsSL https://raw.githubusercontent.com/RylanQ/ryprox/main/install.sh | sudo bash -s -- --follow ${primary} --follow-token ${n.token}`;
+        out.replaceChildren(h("div", { class: "banner" },
+          h("p", {}, h("b", {}, "Copy this now. "), "The token won't be shown again. It gives the new server a full copy of this one, so keep it safe."),
+          h("p", {}, "On the new server, run:"), h("pre", { class: "secret" }, cmd),
+          h("div", { class: "row" }, h("button", { class: "btn small", type: "button", onclick: () => copy(cmd) }, "Copy")),
+          h("p", { class: "muted mt" }, "Then point your DNS at both servers (with health checks), or use a floating IP. For site connectors, list every server in RYPROX_SERVER.")));
+        name.value = "";
+        load();
+      } catch (e) { showError(form, e); }
+      finally { busy(add, false); }
+    });
+    box.replaceChildren(out,
+      r.nodes.length ? h("ul", { class: "plain-list" }, r.nodes.map((n) => h("li", {},
+        h("span", {}, h("b", {}, n.name), h("span", { class: "muted" },
+          n.lastSeenAt && !n.lastSeenAt.startsWith("0001") ? ` · last copied ${ago(n.lastSeenAt)} from ${n.lastIp}` : " · not connected yet")),
+        h("button", { class: "btn small", type: "button", onclick: async () => {
+          if (!(await confirmDialog(`Remove ${n.name}?`, "It stops receiving changes. It keeps serving its last copy until you turn it off.", "Remove"))) return;
+          try { await api("DELETE", `/api/nodes/${n.id}`); load(); } catch (e) { toast(e.message, "error"); }
+        } }, "Remove")))) : h("p", { class: "muted" }, "Only this server so far."),
       form);
   };
   load();

@@ -364,6 +364,7 @@ func (s *Server) buildPortal() http.Handler {
 		s.passkeyLoginFinish(w, r, rl, anyone)
 	})
 	mux.HandleFunc("GET "+p+"tunnel", s.handleTunnel)
+	mux.HandleFunc("GET "+p+"node/sync", s.handleNodeSync)
 	mux.HandleFunc("GET "+p+"sso/callback", s.handleSSOCallback)
 	mux.HandleFunc("GET "+p+"sso/{id}/start", s.handleSSOStart)
 	mux.HandleFunc("GET "+p+"api/tokens", portalUser(s.listTokens))
@@ -373,7 +374,7 @@ func (s *Server) buildPortal() http.Handler {
 	mux.HandleFunc("POST "+p+"api/invite/finish", s.handleInviteFinish)
 	mux.HandleFunc(p, func(w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) })
 
-	return s.securityHeaders(s.csrfProtect(s.requireSecurePost(mux)))
+	return s.securityHeaders(s.readOnly(s.csrfProtect(s.requireSecurePost(mux))))
 }
 
 // allowedSites lists the enabled private routes userID may open.

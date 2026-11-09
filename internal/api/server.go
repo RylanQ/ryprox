@@ -19,6 +19,7 @@ import (
 
 	"github.com/rylanq/ryprox/internal/auth"
 	"github.com/rylanq/ryprox/internal/certs"
+	"github.com/rylanq/ryprox/internal/cluster"
 	"github.com/rylanq/ryprox/internal/config"
 	"github.com/rylanq/ryprox/internal/console"
 	"github.com/rylanq/ryprox/internal/crowdsec"
@@ -46,6 +47,12 @@ type Server struct {
 	Box    *secrets.Box
 	Log    *slog.Logger
 	UI     fs.FS // the web/static directory
+
+	// DataDir is the data folder (the primary sends its secret key and
+	// certificates to followers from here).
+	DataDir string
+	// Follower is set when this server mirrors a primary; it is then read-only.
+	Follower *cluster.Follower
 
 	// Tunnels reaches services on remote sites through connected agents.
 	Tunnels *tunnel.Hub
@@ -173,6 +180,9 @@ func (s *Server) Handler() http.Handler {
 		s.deletePasskey(w, r, u)
 	})
 	priv("POST /api/import/npm", s.handleImportNPM)
+	priv("GET /api/nodes", s.handleListNodes)
+	priv("POST /api/nodes", s.handleCreateNode)
+	priv("DELETE /api/nodes/{id}", s.handleDeleteNode)
 	priv("GET /api/sites", s.handleListSites)
 	priv("POST /api/sites", s.handleCreateSite)
 	priv("POST /api/sites/{id}/token", s.handleSiteToken)
@@ -219,7 +229,7 @@ func (s *Server) Handler() http.Handler {
 		files.ServeHTTP(w, r)
 	}))
 
-	return s.securityHeaders(s.restrictHosts(s.csrfProtect(s.requireSecurePost(mux))))
+	return s.securityHeaders(s.restrictHosts(s.readOnly(s.csrfProtect(s.requireSecurePost(mux)))))
 }
 
 // securityHeaders hardens every admin response against common attacks.
@@ -588,6 +598,9 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		"version":       version.Version,
 		// Warn when the dashboard is used over plain HTTP from another machine.
 		"insecure": r.TLS == nil && !s.isLocal(r),
+	}
+	if s.Follower != nil {
+		out["follower"] = s.Follower.Status()
 	}
 	if u, _ := s.currentSession(r); u != nil {
 		out["user"] = map[string]any{"username": u.Username}

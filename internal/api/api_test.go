@@ -42,11 +42,11 @@ func newEnv(t *testing.T) *env {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
-	box, _ := secrets.LoadOrCreate(filepath.Join(dir, "key"))
+	box, _ := secrets.LoadOrCreate(filepath.Join(dir, "secret.key"))
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	eng := proxy.NewEngine(log)
 	t.Cleanup(eng.Close)
-	s := &Server{Store: st, Engine: eng, Box: box, Log: log,
+	s := &Server{Store: st, Engine: eng, Box: box, Log: log, DataDir: dir,
 		UI: fstest.MapFS{"index.html": {Data: []byte("<!doctype html><title>RyProx</title>")}}}
 	s.Certs = certs.New(filepath.Join(dir, "certs"), func(string) bool { return false }, log)
 	code, err := New(t.Context(), s)

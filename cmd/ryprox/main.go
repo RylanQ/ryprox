@@ -16,6 +16,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -99,6 +100,9 @@ func serve(args []string, stdout, stderr io.Writer) error {
 	logLevel := fs.String("log-level", env("RYPROX_LOG_LEVEL", "info"), "debug, info, warn or error (env RYPROX_LOG_LEVEL)")
 	logFormat := fs.String("log-format", env("RYPROX_LOG_FORMAT", "text"), "text or json (env RYPROX_LOG_FORMAT)")
 	guacd := fs.String("guacd", env("RYPROX_GUACD", ""), "guacd address for remote desktops, unless set in the dashboard (env RYPROX_GUACD)")
+	follow := fs.String("follow", env("RYPROX_FOLLOW", ""), "run as a follower of this primary, e.g. https://login.example.com (env RYPROX_FOLLOW)")
+	followToken := fs.String("follow-token", env("RYPROX_FOLLOW_TOKEN", ""), "this server's token from the primary's dashboard (env RYPROX_FOLLOW_TOKEN)")
+	followAddr := fs.String("follow-address", env("RYPROX_FOLLOW_ADDRESS", ""), "optional host:port of the primary, when its name points at several servers (env RYPROX_FOLLOW_ADDRESS)")
 	relayHost := fs.String("relay-host", env("RYPROX_FORWARD_HOST", ""), "how guacd reaches RyProx for remote desktops on a site: 127.0.0.1, or the container name with Docker (env RYPROX_FORWARD_HOST)")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -128,6 +132,9 @@ func serve(args []string, stdout, stderr io.Writer) error {
 		ACMECAFile:    *acmeCA,
 		Guacd:         *guacd,
 		RelayHost:     *relayHost,
+		Follow:        *follow,
+		FollowToken:   *followToken,
+		FollowAddress: *followAddr,
 		Log:           log,
 		UI:            web.Static(),
 		Ready: func(adminURL, setupCode string) {
@@ -264,7 +271,7 @@ func initCmd(args []string, stdout, stderr io.Writer) error {
 func connect(args []string, stderr io.Writer) error {
 	fs := flag.NewFlagSet("connect", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	serverURL := fs.String("server", env("RYPROX_SERVER", ""), "RyProx's sign-in address, e.g. https://login.example.com (env RYPROX_SERVER)")
+	serverURL := fs.String("server", env("RYPROX_SERVER", ""), "RyProx's sign-in address, e.g. https://login.example.com; with several RyProx servers, list each as https://login.example.com@203.0.113.5:443, comma-separated (env RYPROX_SERVER)")
 	token := fs.String("token", env("RYPROX_TOKEN", ""), "the site's token from the dashboard; prefer the env variable, so it isn't visible in the process list (env RYPROX_TOKEN)")
 	allow := fs.String("allow", env("RYPROX_ALLOW", ""), "comma-separated addresses, ranges (192.168.1.0/24) or host names RyProx may reach here; empty allows any (env RYPROX_ALLOW)")
 	if err := fs.Parse(args); err != nil {
@@ -281,6 +288,34 @@ func connect(args []string, stderr io.Writer) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	log.Info("starting site connector", "version", version.Version, "server", *serverURL)
-	a := &tunnel.Agent{Server: *serverURL, Token: *token, Allow: list, Log: log}
-	return a.Run(ctx)
+	// One connection per RyProx server, so whichever server a visitor
+	// reaches can use this site.
+	var wg sync.WaitGroup
+	errs := make(chan error, 8)
+	for _, entry := range strings.Split(*serverURL, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		srv, addr := entry, ""
+		if i := strings.LastIndex(entry, "@"); i > len("https://") {
+			srv, addr = entry[:i], entry[i+1:]
+		}
+		a := &tunnel.Agent{Server: srv, Address: addr, Token: *token, Allow: list, Log: log.With("server", entry)}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := a.Run(ctx); err != nil {
+				errs <- err
+				stop()
+			}
+		}()
+	}
+	wg.Wait()
+	select {
+	case err := <-errs:
+		return err
+	default:
+		return nil
+	}
 }

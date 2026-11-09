@@ -18,6 +18,8 @@
 #   --dashboard-domain NAME also serve the dashboard at https://NAME (default: local only)
 #   --email ADDRESS         email for Let's Encrypt (turns on automatic HTTPS)
 #   --staging | --no-staging  start with test certificates (default: yes)
+#   --follow URL --follow-token TOKEN
+#                           make this server a follower of an existing RyProx (from its Settings → Servers)
 #   --remote-desktop | --no-remote-desktop
 #                           also install guacd, for Windows (RDP) and Mac (VNC) desktops in the browser
 #   --version vX.Y.Z        install a specific version (default: newest)
@@ -35,7 +37,7 @@ CONTAINER=ryprox
 VOLUME=ryprox-data
 ADMIN_PORT=8081
 
-METHOD="" DOMAIN="" DASHBOARD="" EMAIL="" STAGING="" DESKTOP="" VERSION="" YES=0 DRY=0
+METHOD="" DOMAIN="" DASHBOARD="" EMAIL="" STAGING="" DESKTOP="" VERSION="" YES=0 DRY=0 FOLLOW="" FOLLOW_TOKEN=""
 GUACD_IMAGE="guacamole/guacd:1.6.0"
 GUACD_CONTAINER=ryprox-guacd
 NETWORK=ryprox-net
@@ -99,6 +101,8 @@ while [ $# -gt 0 ]; do
     --email) EMAIL=${2:?--email needs a value}; shift ;;
     --staging) STAGING=yes ;;
     --no-staging) STAGING=no ;;
+    --follow) FOLLOW=${2:?--follow needs an address}; shift ;;
+    --follow-token) FOLLOW_TOKEN=${2:?--follow-token needs a value}; shift ;;
     --remote-desktop) DESKTOP=yes ;;
     --no-remote-desktop) DESKTOP=no ;;
     --version) VERSION=${2:?--version needs a value}; shift ;;
@@ -172,7 +176,11 @@ ok "Method: $([ "$METHOD" = docker ] && echo Docker || echo 'system service') ·
 
 # ---------- questions (first install only) ----------
 PUBLIC_IP=""
-if [ -z "$EXISTING" ]; then
+if [ -n "$FOLLOW" ]; then
+  case "$FOLLOW" in https://*) ;; *) die "--follow must start with https://" ;; esac
+  [ -n "$FOLLOW_TOKEN" ] || die "--follow needs --follow-token from the primary's Settings → Servers"
+fi
+if [ -z "$EXISTING" ] && [ -z "$FOLLOW" ]; then
   step "Setup"
   PUBLIC_IP=$(curl -4 -fsS --max-time 5 https://api.ipify.org 2>/dev/null || true)
   if [ -n "$PUBLIC_IP" ]; then say "  This server's public IP address looks like ${B}${PUBLIC_IP}${N}."; fi
@@ -306,6 +314,9 @@ install_docker() {
     net_args=(--network "$NETWORK" -e "RYPROX_GUACD=$GUACD_CONTAINER:4822" -e "RYPROX_FORWARD_HOST=$CONTAINER")
   fi
 
+  if [ -n "$FOLLOW" ]; then
+    net_args+=(-e "RYPROX_FOLLOW=$FOLLOW" -e "RYPROX_FOLLOW_TOKEN=$FOLLOW_TOKEN")
+  fi
   run docker volume create "$VOLUME" >/dev/null
   if [ -z "$EXISTING" ] && [ ${#INIT_ARGS[@]} -gt 0 ]; then
     run docker run --rm -v "$VOLUME:/data" "$img" init --data /data "${INIT_ARGS[@]}"
@@ -357,6 +368,16 @@ install_native() {
     fi
   fi
 
+  if [ -n "$FOLLOW" ]; then
+    if [ "$DRY" = 1 ]; then
+      say "  [dry-run] write /etc/ryprox/follow.env"
+    else
+      install -d -m 700 /etc/ryprox
+      umask 077
+      printf 'RYPROX_FOLLOW=%s\nRYPROX_FOLLOW_TOKEN=%s\n' "$FOLLOW" "$FOLLOW_TOKEN" > /etc/ryprox/follow.env
+      chmod 600 /etc/ryprox/follow.env
+    fi
+  fi
   if [ "$DRY" = 1 ]; then
     say "  [dry-run] write $UNIT"
   else
@@ -371,6 +392,7 @@ Wants=network-online.target
 ExecStart=$BIN serve
 Environment=RYPROX_DATA=$DATA
 Environment=RYPROX_ADMIN=127.0.0.1:$ADMIN_PORT
+EnvironmentFile=-/etc/ryprox/follow.env
 Restart=on-failure
 RestartSec=3
 User=ryprox

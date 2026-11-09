@@ -174,6 +174,17 @@ CREATE TABLE sites (
 	last_seen_at INTEGER NOT NULL DEFAULT 0
 );
 `,
+	// 5: follower servers that mirror this one
+	`
+CREATE TABLE nodes (
+	id           INTEGER PRIMARY KEY AUTOINCREMENT,
+	name         TEXT    NOT NULL UNIQUE COLLATE NOCASE,
+	token_hash   BLOB    NOT NULL UNIQUE,
+	created_at   INTEGER NOT NULL,
+	last_seen_at INTEGER NOT NULL DEFAULT 0,
+	last_ip      TEXT    NOT NULL DEFAULT ''
+);
+`,
 }
 
 func (s *Store) migrate(ctx context.Context) error {

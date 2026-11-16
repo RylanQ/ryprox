@@ -36,6 +36,7 @@ const cap = (s) => (s ? s[0].toUpperCase() + s.slice(1) : s);
 const params = new URLSearchParams(location.search);
 const site = params.get("site") || "";
 const rd = params.get("rd") || "/";
+const siteState = params.get("state") || "";
 
 function field(label, input, hint) {
   input.id ||= "f" + Math.random().toString(36).slice(2);
@@ -75,7 +76,7 @@ function layout(...content) {
 // Ask for a one-time code for the site and go there.
 async function continueToSite() {
   try {
-    const r = await api("continue", { site, rd });
+    const r = await api("continue", { site, rd, state: siteState });
     location.replace(r.url);
   } catch (e) {
     if (e.denied) return deniedPage();
@@ -85,7 +86,10 @@ async function continueToSite() {
 }
 
 function afterSignIn() {
-  if (site) return continueToSite();
+  if (site && siteState) return continueToSite();
+  // An old or hand-made link without the site's state: start again at the
+  // site itself, but only if it's one of this person's own sites.
+  if (site && (state.sites || []).includes(site)) return location.replace("https://" + site + (location.port ? ":" + location.port : "") + "/");
   return sitesPage();
 }
 
@@ -123,7 +127,7 @@ function loginPage() {
   }
   for (const p of state.sso || []) {
     const q = new URLSearchParams();
-    if (site) { q.set("site", site); q.set("rd", rd); }
+    if (site) { q.set("site", site); q.set("rd", rd); q.set("state", siteState); }
     extras.push(h("a", { class: "btn", href: `${BASE}sso/${encodeURIComponent(p.id)}/start${q.toString() ? "?" + q : ""}` }, `Continue with ${p.name}`));
   }
   layout(h("h1", {}, "Sign in"), h("p", { class: "lede" }, "Use your RyProx account."), form,

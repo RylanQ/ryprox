@@ -122,6 +122,24 @@ func TestFollower(t *testing.T) {
 	if err := f.Sync(t.Context()); err != nil {
 		t.Fatal(err)
 	}
+	// Recovery codes are refused on a follower (they'd come back at the next
+	// sync), and a used authenticator code stays used across a sync.
+	other := fe.client()
+	_, step1 := other.post("/api/login", map[string]string{"username": "admin", "password": pw})
+	if code, out := other.post("/api/login/verify", map[string]string{"loginToken": step1["loginToken"].(string), "code": "abcd-efgh-jkmn"}); code != http.StatusConflict {
+		t.Fatalf("recovery code on follower: %d %v", code, out)
+	}
+	if code, _ := other.post("/api/login/verify", map[string]string{"loginToken": step1["loginToken"].(string), "code": totp}); code != http.StatusUnauthorized {
+		t.Fatalf("authenticator code replayed before sync: %d", code)
+	}
+	admin.post("/api/routes", map[string]any{"hostname": "mid.example.com", "enabled": true,
+		"config": map[string]any{"targets": []map[string]string{{"url": "http://10.0.0.9"}}}})
+	if err := f.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if code, _ := other.post("/api/login/verify", map[string]string{"loginToken": step1["loginToken"].(string), "code": totp}); code != http.StatusUnauthorized {
+		t.Fatalf("authenticator code replayed after sync: %d", code)
+	}
 	if code, _ := fc.req("GET", "/api/routes", nil, nil); code != 200 {
 		t.Fatal("follower session lost after sync")
 	}
@@ -132,7 +150,7 @@ func TestFollower(t *testing.T) {
 		t.Fatal(err)
 	}
 	routes, _ = st.ListRoutes(t.Context())
-	if len(routes) != 2 {
+	if len(routes) != 3 {
 		t.Fatalf("change not mirrored: %d routes", len(routes))
 	}
 

@@ -157,16 +157,42 @@ func (e *env) join(admin *client, name string, routes []int64) (int64, string, s
 // one-time-code handover, and returns the site cookie.
 func (e *env) open(host, rd, signInCookie, from string) (string, *httptest.ResponseRecorder) {
 	e.t.Helper()
-	cont := e.signInPage("POST", "/.ryprox/api/continue", signInCookie, map[string]string{"site": host, "rd": rd}, from)
-	if cont.Code != 200 {
+	uri, stateCookie, cont := e.handover(host, rd, signInCookie, from)
+	if uri == "" {
 		return "", cont
+	}
+	cb := e.site("GET", host, uri, stateCookie, from)
+	return cookieNamed(cb, "__Host-ryprox-access"), cb
+}
+
+// handover starts a sign-in at the site (which sets the browser's state
+// cookie) and asks the sign-in domain for a one-time code. It returns the
+// callback path and the state cookie.
+func (e *env) handover(host, rd, signInCookie, from string) (string, string, *httptest.ResponseRecorder) {
+	e.t.Helper()
+	first := e.site("GET", host, rd, "", from)
+	state, stateCookie := strings.Repeat("0", 64), ""
+	if loc, err := url.Parse(first.Header().Get("Location")); err == nil && loc.Query().Get("state") != "" {
+		state, stateCookie = loc.Query().Get("state"), cookieNamed(first, "__Host-ryprox-state")
+	}
+	cont := e.signInPage("POST", "/.ryprox/api/continue", signInCookie, map[string]string{"site": host, "rd": rd, "state": state}, from)
+	if cont.Code != 200 {
+		return "", "", cont
 	}
 	u, _ := url.Parse(decode(cont)["url"].(string))
 	if u.Host != host || u.Path != "/.ryprox/callback" {
 		e.t.Fatalf("callback URL %s", u)
 	}
-	cb := e.site("GET", host, u.RequestURI(), "", from)
-	return sessionCookie(cb), cb
+	return u.RequestURI(), stateCookie, cont
+}
+
+func cookieNamed(rec *httptest.ResponseRecorder, name string) string {
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == name && c.Value != "" {
+			return c.Name + "=" + c.Value
+		}
+	}
+	return ""
 }
 
 func identityBackend(t *testing.T) *httptest.Server {
@@ -193,8 +219,10 @@ func TestPrivateIsTheDefault(t *testing.T) {
 	}
 	e.enableSignIn()
 	rec := e.site("GET", "d.example.com", "/photos?x=1", "", visitor)
-	want := "https://" + signInHost + "/.ryprox/login?" + url.Values{"site": {"d.example.com"}, "rd": {"/photos?x=1"}}.Encode()
-	if rec.Code != http.StatusFound || rec.Header().Get("Location") != want {
+	loc, _ := url.Parse(rec.Header().Get("Location"))
+	q := loc.Query()
+	if rec.Code != http.StatusFound || loc.Host != signInHost || loc.Path != "/.ryprox/login" || q.Get("site") != "d.example.com" ||
+		q.Get("rd") != "/photos?x=1" || len(q.Get("state")) != 64 || cookieNamed(rec, "__Host-ryprox-state") == "" {
 		t.Fatalf("anonymous visitor: %d %q", rec.Code, rec.Header().Get("Location"))
 	}
 	if strings.Contains(rec.Body.String(), "user=") {
@@ -274,31 +302,47 @@ func TestHandoverCodes(t *testing.T) {
 	nas := e.privateRoute(admin, "nas.example.com", b.URL, nil)
 	_, _, signIn := e.join(admin, "sam", []int64{photos, nas})
 
-	issue := func() string {
-		cont := e.signInPage("POST", "/.ryprox/api/continue", signIn, map[string]string{"site": "photos.example.com", "rd": "/"}, visitor)
-		u, _ := url.Parse(decode(cont)["url"].(string))
-		return u.RequestURI()
+	issue := func() (string, string) {
+		uri, ck, _ := e.handover("photos.example.com", "/", signIn, visitor)
+		return uri, ck
 	}
-	redeemed := func(host, uri, from string) bool {
-		return sessionCookie(e.site("GET", host, uri, "", from)) != ""
+	redeemed := func(host, uri, cookie, from string) bool {
+		return cookieNamed(e.site("GET", host, uri, cookie, from), "__Host-ryprox-access") != ""
 	}
-	// Single use.
-	uri := issue()
-	if !redeemed("photos.example.com", uri, visitor) || redeemed("photos.example.com", uri, visitor) {
+	// Single use. The visitor's address may change on the way (IPv4/IPv6).
+	uri, ck := issue()
+	if !redeemed("photos.example.com", uri, ck, "[2001:db8::7]:4000") || redeemed("photos.example.com", uri, ck, visitor) {
 		t.Fatal("code is not single-use")
 	}
-	// Bound to the visitor's address: a code someone else obtained can't be
-	// used to sign a victim in (login CSRF), or by the attacker.
-	if redeemed("photos.example.com", issue(), attacker) {
-		t.Fatal("code redeemed from another address")
+	// Bound to the browser that started the sign-in: a code someone else
+	// obtained can't sign a victim in (login CSRF), and a stolen code is no
+	// use without the cookie.
+	uri, _ = issue()
+	if redeemed("photos.example.com", uri, "", visitor) {
+		t.Fatal("code redeemed without the state cookie")
+	}
+	uri, _ = issue()
+	_, otherBrowser := issue()
+	if redeemed("photos.example.com", uri, otherBrowser, attacker) {
+		t.Fatal("code redeemed with another browser's state cookie")
 	}
 	// Bound to one site.
-	if redeemed("nas.example.com", issue(), visitor) {
+	uri, ck = issue()
+	if redeemed("nas.example.com", uri, ck, visitor) {
 		t.Fatal("photos code redeemed on nas")
 	}
-	// Made-up codes do nothing.
-	if redeemed("photos.example.com", "/.ryprox/callback?code=guess&rd=/", visitor) {
-		t.Fatal("invented code accepted")
+	// Made-up and altered codes do nothing, and failure doesn't redirect (no loops).
+	uri, ck = issue()
+	forged := strings.Replace(uri, "code=", "code=x", 1)
+	for _, bad := range []string{"/.ryprox/callback?code=guess&rd=/", forged, uri[:len(uri)-len("&rd=%2F")-3] + "000&rd=%2F"} {
+		rec := e.site("GET", "photos.example.com", bad, ck, visitor)
+		if rec.Code != http.StatusBadRequest || cookieNamed(rec, "__Host-ryprox-access") != "" {
+			t.Fatalf("bad code %q: %d", bad, rec.Code)
+		}
+	}
+	// The sign-in domain won't issue a code without a state from the site.
+	if rec := e.signInPage("POST", "/.ryprox/api/continue", signIn, map[string]string{"site": "photos.example.com", "rd": "/"}, visitor); rec.Code != http.StatusBadRequest {
+		t.Fatalf("continue without state: %d", rec.Code)
 	}
 }
 
@@ -325,7 +369,7 @@ func TestRevocationIsImmediate(t *testing.T) {
 		!strings.HasPrefix(rec.Header().Get("Location"), "https://"+signInHost+"/.ryprox/login") {
 		t.Fatalf("disabled user still in: %d", rec.Code)
 	}
-	if rec := e.signInPage("POST", "/.ryprox/api/continue", signIn, map[string]string{"site": "photos.example.com"}, visitor); rec.Code != http.StatusUnauthorized {
+	if rec := e.signInPage("POST", "/.ryprox/api/continue", signIn, map[string]string{"site": "photos.example.com", "state": strings.Repeat("a", 64)}, visitor); rec.Code != http.StatusUnauthorized {
 		t.Fatalf("disabled user's sign-in session still works: %d", rec.Code)
 	}
 }

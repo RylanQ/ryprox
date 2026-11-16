@@ -686,3 +686,26 @@ func TestUptimeHistory(t *testing.T) {
 		t.Fatalf("uptime %v", up)
 	}
 }
+
+func TestPrivateRoutesAlwaysUseHTTPS(t *testing.T) {
+	a := echo(t, "a")
+	pub := route(1, "pub.example.com", a.URL)
+	priv := route(2, "priv.example.com", a.URL)
+	priv.Config.Access = store.Access{Mode: store.AccessPrivate}
+	priv.Config.HTTPSRedirect = false
+	pub.Config.HTTPSRedirect = false
+	e := newEngine(t, pub, priv)
+	if e.IsHTTPSRedirect("pub.example.com") || !e.IsHTTPSRedirect("priv.example.com") {
+		t.Fatal("private routes must redirect to HTTPS even with the option off")
+	}
+}
+
+func TestActionPageLink(t *testing.T) {
+	for href, want := range map[string]string{"/a?b=1": `href="/a?b=1"`, "//evil.com": `href="/"`, "https://evil.com": `href="/"`, `/"><script>`: `href="/&#34;&gt;&lt;script&gt;"`} {
+		rec := httptest.NewRecorder()
+		WriteActionPage(rec, 400, "t", "m", "Try again", href)
+		if !strings.Contains(rec.Body.String(), want) {
+			t.Errorf("%q: %s", href, rec.Body.String())
+		}
+	}
+}

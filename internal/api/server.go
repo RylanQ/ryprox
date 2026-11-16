@@ -77,10 +77,12 @@ type Server struct {
 	mu         sync.Mutex
 	setupHash  []byte // hash of the one-time setup code; nil once set up
 	pending    map[string]pendingLogin
-	handoffs   map[string]handoff  // one-time codes that sign a visitor in to a site
-	ceremonies map[string]ceremony // passkey challenges in progress
-	ssoStates  map[string]ssoState // single sign-on logins in progress
-	ssoCache   sync.Map            // discovered providers
+	handoffs   map[string]time.Time // used one-time sign-in codes, until they expire
+	ceremonies map[string]ceremony  // passkey challenges in progress
+	ssoStates  map[string]ssoState  // single sign-on logins in progress
+	ssoCache   sync.Map             // discovered providers
+
+	crowdsecLive crowdsec.Config // what the bouncer is running with
 
 	portalOnce sync.Once
 	portal     http.Handler
@@ -99,7 +101,7 @@ func New(ctx context.Context, s *Server) (setupCode string, err error) {
 	s.limiter = auth.NewLimiter()
 	s.ipLimit = auth.NewLimiter()
 	s.pending = map[string]pendingLogin{}
-	s.handoffs = map[string]handoff{}
+	s.handoffs = map[string]time.Time{}
 	st, err := s.Store.GetSettings(ctx)
 	if err != nil {
 		return "", err
@@ -431,8 +433,8 @@ func (s *Server) Cleanup(ctx context.Context) {
 			delete(s.pending, k)
 		}
 	}
-	for k, h := range s.handoffs {
-		if time.Now().After(h.expires) {
+	for k, exp := range s.handoffs {
+		if time.Now().After(exp) {
 			delete(s.handoffs, k)
 		}
 	}

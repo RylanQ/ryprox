@@ -136,6 +136,9 @@ func (s *Server) Reload(ctx context.Context) error {
 	if s.Certs != nil {
 		s.Certs.Configure(st)
 	}
+	// Settings kept outside the settings struct may have changed too.
+	s.startCrowdSec(ctx)
+	s.ssoCache.Range(func(k, _ any) bool { s.ssoCache.Delete(k); return true })
 	return s.Engine.Apply(routes)
 }
 

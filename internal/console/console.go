@@ -46,6 +46,10 @@ type Service struct {
 	// RelayHost is how guacd reaches RyProx, for remote desktops on a site
 	// (default 127.0.0.1; the container name with Docker).
 	RelayHost string
+	// NoLearn stops new SSH server keys being trusted on first use. Set on
+	// follower servers, whose copy of the remembered keys is replaced at
+	// every sync.
+	NoLearn bool
 	// DefaultGuacd is used when no guacd address is saved (e.g. guacd:4822 in Docker).
 	DefaultGuacd string
 	// Dial reaches a machine, through a site's tunnel when site != 0.

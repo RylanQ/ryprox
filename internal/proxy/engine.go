@@ -529,7 +529,8 @@ func (e *Engine) errorHandler(lr *liveRoute) func(http.ResponseWriter, *http.Req
 // redirected to HTTPS.
 func (e *Engine) IsHTTPSRedirect(host string) bool {
 	lr, ok := e.snap.Load().routes[host]
-	return ok && lr.route.Config.HTTPSRedirect
+	// Private routes always use HTTPS: sign-in and session cookies need it.
+	return ok && (lr.route.Config.HTTPSRedirect || !lr.route.Config.Access.IsPublic())
 }
 
 // ServeHTTP forwards the request to the route for its Host header.
@@ -581,6 +582,11 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if cfg.IsConsole() {
+		if tok != "" {
+			// A leaked script token must never be enough for a shell or desktop.
+			WritePage(w, http.StatusForbidden, "Sign-in needed", "Terminals and remote desktops can't be opened with an access token. Sign in with a browser.")
+			return
+		}
 		cb := e.console.Load()
 		user, _ := r.Context().Value(userKey{}).(string)
 		if cb == nil || cb.c == nil || user == "" {
@@ -669,6 +675,23 @@ func isUpgrade(r *http.Request) bool {
 
 // WritePage writes a small, self-contained error page.
 func WritePage(w http.ResponseWriter, code int, title, msg string) {
+	writePage(w, code, title, msg, "", "")
+}
+
+// WriteActionPage is WritePage with one link. href must be a path on the
+// same site.
+func WriteActionPage(w http.ResponseWriter, code int, title, msg, linkText, href string) {
+	if !strings.HasPrefix(href, "/") || strings.HasPrefix(href, "//") {
+		href = "/"
+	}
+	writePage(w, code, title, msg, linkText, href)
+}
+
+func writePage(w http.ResponseWriter, code int, title, msg, linkText, href string) {
+	link := ""
+	if linkText != "" {
+		link = `<p><a href="` + html.EscapeString(href) + `">` + html.EscapeString(linkText) + `</a></p>`
+	}
 	h := w.Header()
 	h.Set("Content-Type", "text/html; charset=utf-8")
 	h.Set("Cache-Control", "no-store")
@@ -678,7 +701,8 @@ func WritePage(w http.ResponseWriter, code int, title, msg string) {
 	_, _ = fmt.Fprintf(w, `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>%d %s</title>
 <style>body{font:16px/1.5 system-ui,sans-serif;display:grid;place-items:center;min-height:100vh;margin:0;background:#f6f7f9;color:#1d2433}
 main{max-width:28rem;padding:2rem;text-align:center}h1{font-size:1.25rem;margin:.5rem 0}p{color:#5b6475}.c{font-size:3rem;font-weight:700;color:#c3c8d2}
-@media(prefers-color-scheme:dark){body{background:#12151b;color:#e7e9ee}p{color:#9aa3b2}.c{color:#3a4150}}</style></head>
-<body><main><div class="c">%d</div><h1>%s</h1><p>%s</p></main></body></html>`,
-		code, html.EscapeString(title), code, html.EscapeString(title), html.EscapeString(msg))
+a{color:#1f6f66;font-weight:600}
+@media(prefers-color-scheme:dark){body{background:#12151b;color:#e7e9ee}p{color:#9aa3b2}.c{color:#3a4150}a{color:#5cc4b8}}</style></head>
+<body><main><div class="c">%d</div><h1>%s</h1><p>%s</p>%s</main></body></html>`,
+		code, html.EscapeString(title), code, html.EscapeString(title), html.EscapeString(msg), link)
 }

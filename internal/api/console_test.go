@@ -94,8 +94,15 @@ func consoleEnv(t *testing.T) (*env, *client, *httptest.Server, string) {
 	e.engine.SetConsole(e.srv.Console)
 	ts := httptest.NewTLSServer(e.engine)
 	t.Cleanup(ts.Close)
-	_, out := admin.post("/api/account/tokens", map[string]any{"name": "t", "scope": "sites"})
-	return e, admin, ts, out["token"].(string)
+	// The admin signs in on the sign-in domain like anyone else.
+	login := decode(e.signInPage("POST", "/.ryprox/api/login", "", map[string]string{"username": "admin", "password": pw}, visitor))
+	rec := e.signInPage("POST", "/.ryprox/api/login/verify", "", map[string]string{
+		"loginToken": login["loginToken"].(string), "code": mustCode(e.setupSecret, 30*time.Second)}, visitor)
+	signIn := sessionCookie(rec)
+	if signIn == "" {
+		t.Fatalf("admin sign-in: %d %s", rec.Code, rec.Body.String())
+	}
+	return e, admin, ts, signIn
 }
 
 func consoleClient(ts *httptest.Server) *http.Client {
@@ -112,7 +119,7 @@ func consoleTicket(t *testing.T, ts *httptest.Server, host, token string, body m
 	t.Helper()
 	b, _ := json.Marshal(body)
 	req, _ := http.NewRequestWithContext(t.Context(), "POST", "https://"+host+"/session", bytes.NewReader(b))
-	req.Header.Set("X-RyProx-Token", token)
+	req.Header.Set("Cookie", token)
 	req.Header.Set("X-RyProx", "1")
 	resp, err := consoleClient(ts).Do(req)
 	if err != nil {
@@ -126,7 +133,7 @@ func consoleTicket(t *testing.T, ts *httptest.Server, host, token string, body m
 
 func dialConsole(t *testing.T, ts *httptest.Server, host, token, ticket string, proto []string) (*websocket.Conn, error) {
 	h := http.Header{}
-	h.Set("X-RyProx-Token", token)
+	h.Set("Cookie", token)
 	c, resp, err := websocket.Dial(t.Context(), "wss://"+host+"/ws?ticket="+ticket,
 		&websocket.DialOptions{HTTPClient: consoleClient(ts), HTTPHeader: h, Subprotocols: proto})
 	if resp != nil && resp.Body != nil {
@@ -136,7 +143,7 @@ func dialConsole(t *testing.T, ts *httptest.Server, host, token, ticket string, 
 }
 
 func TestSSHConsole(t *testing.T) {
-	e, admin, ts, token := consoleEnv(t)
+	e, admin, ts, signIn := consoleEnv(t)
 	addr := sshServer(t, "sam", "hunter22")
 	code, out := admin.post("/api/routes", map[string]any{"hostname": "ssh.example.com", "enabled": true,
 		"config": map[string]any{"kind": "ssh", "access": map[string]any{"mode": "private", "users": []int64{1}},
@@ -150,6 +157,10 @@ func TestSSHConsole(t *testing.T) {
 		t.Fatalf("public console: %d", code)
 	}
 
+	token, _ := e.open("ssh.example.com", "/", signIn, visitor) // the site's session cookie
+	if token == "" {
+		t.Fatal("no site session")
+	}
 	status, tk := consoleTicket(t, ts, "ssh.example.com", token, map[string]any{"username": "sam", "password": "hunter22"})
 	if status != 200 || tk == "" {
 		t.Fatalf("ticket: %d", status)
@@ -195,15 +206,18 @@ func TestSSHConsole(t *testing.T) {
 	if websocket.CloseStatus(err) != websocket.StatusPolicyViolation {
 		t.Fatalf("wrong password: %v", err)
 	}
-	// Without access, nothing.
-	if s, _ := consoleTicket(t, ts, "ssh.example.com", "ryp_bad", map[string]any{}); s != 401 {
-		t.Fatalf("no access: %d", s)
+	// Without a session, nothing; and an access token is never enough for a shell.
+	if s, _ := consoleTicket(t, ts, "ssh.example.com", "", map[string]any{}); s != 401 {
+		t.Fatalf("no session: %d", s)
 	}
-	_ = e
+	_, out = admin.post("/api/account/tokens", map[string]any{"name": "t", "scope": "sites"})
+	if rec := e.tokenReq("ssh.example.com", "/info", map[string]string{"X-RyProx-Token": out["token"].(string)}); rec.Code != http.StatusForbidden {
+		t.Fatalf("token on a console: %d", rec.Code)
+	}
 }
 
 func TestGuacRelay(t *testing.T) {
-	_, admin, ts, token := consoleEnv(t)
+	e, admin, ts, signIn := consoleEnv(t)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -243,6 +257,7 @@ func TestGuacRelay(t *testing.T) {
 	if code, _ := admin.req("PUT", "/api/console", map[string]string{"guacd": ln.Addr().String()}, nil); code != 200 {
 		t.Fatal("set guacd")
 	}
+	token, _ := e.open("pc.example.com", "/", signIn, visitor)
 	_, tk := consoleTicket(t, ts, "pc.example.com", token, map[string]any{"width": 1024, "height": 768})
 	c, err := dialConsole(t, ts, "pc.example.com", token, tk, []string{"guacamole"})
 	if err != nil {

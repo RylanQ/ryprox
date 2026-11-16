@@ -128,7 +128,7 @@ func Run(ctx context.Context, o Options) error {
 		go follower.Run(ctx)
 	}
 	engine.SetGate(adm) // private routes check every request against the access lists
-	adm.Console = &console.Service{Store: st, Box: box, Log: log, UI: o.UI, DefaultGuacd: o.Guacd, RelayHost: o.RelayHost,
+	adm.Console = &console.Service{Store: st, Box: box, Log: log, UI: o.UI, DefaultGuacd: o.Guacd, RelayHost: o.RelayHost, NoLearn: follower != nil,
 		Audit: func(r *http.Request, actor, action, detail string) { adm.Audit(r, actor, action, detail) }}
 	engine.SetConsole(adm.Console)
 	hub := tunnel.NewHub(log)

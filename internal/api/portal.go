@@ -4,13 +4,18 @@ package api
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"io/fs"
 	"net"
 	"net/http"
 	"net/url"
 	"path"
+	"regexp"
 	"strings"
 	"time"
 
@@ -29,10 +34,19 @@ import (
 //
 //  1. A visitor without a session for photos.example.com is redirected to
 //     https://<sign-in domain>/.ryprox/login?site=photos.example.com&rd=/path
+//     The site also sets a short-lived state cookie in their browser and
+//     passes its hash along.
 //  2. They sign in there (or are already signed in there) and RyProx issues
-//     a one-time code for that site, bound to their IP address.
+//     a one-time code for that site, carrying the state hash.
 //  3. The browser is sent to https://photos.example.com/.ryprox/callback,
-//     where RyProx redeems the code and sets a session for that site only.
+//     where RyProx redeems the code and sets a session for that site only,
+//     if the browser still holds the matching state cookie.
+//
+// The state cookie ties the code to the browser that started the sign-in,
+// so a code can't be used to sign someone else in (login CSRF), and a stolen
+// code is useless without the cookie. Codes are signed with the server's
+// secret rather than kept in memory, so with several RyProx servers the
+// callback may land on any of them.
 
 const (
 	inviteTTL  = 7 * 24 * time.Hour // how long an invite link works
@@ -47,11 +61,75 @@ var portalFiles = map[string]string{
 	"favicon.svg": "image/svg+xml",
 }
 
-type handoff struct {
-	userID  int64
-	host    string
-	ip      string
-	expires time.Time
+// handoffClaims is the content of a one-time sign-in code.
+type handoffClaims struct {
+	User    int64  `json:"u"`
+	Host    string `json:"h"`
+	State   string `json:"s"` // hash of the browser's state cookie
+	Expires int64  `json:"e"`
+	Nonce   string `json:"n"`
+}
+
+const (
+	stateCookie   = "ryprox-state"
+	stateTTL      = 15 * time.Minute
+	handoffPurp   = "handoff-code"
+	maxCeremonies = 20000
+)
+
+var stateHashRE = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+func stateHash(cookieValue string) string {
+	sum := sha256.Sum256([]byte("ryprox-state:" + cookieValue))
+	return hex.EncodeToString(sum[:])
+}
+
+// browserState returns the hash of this browser's state cookie for the
+// site, setting the cookie first if it has none.
+func (s *Server) browserState(w http.ResponseWriter, r *http.Request) (string, error) {
+	name := "__Host-" + stateCookie
+	if c, err := r.Cookie(name); err == nil && len(c.Value) >= 32 && len(c.Value) <= 100 {
+		return stateHash(c.Value), nil // reuse, so several tabs don't trip each other up
+	}
+	v, err := auth.NewToken()
+	if err != nil {
+		return "", err
+	}
+	http.SetCookie(w, &http.Cookie{Name: name, Value: v, Path: "/", MaxAge: int(stateTTL.Seconds()),
+		HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode})
+	return stateHash(v), nil
+}
+
+func (s *Server) signHandoff(c handoffClaims) string {
+	b, _ := json.Marshal(c)
+	p := base64.RawURLEncoding.EncodeToString(b)
+	return p + "." + s.Box.MAC(handoffPurp, p)
+}
+
+// openHandoff checks a code's signature and expiry, and that it hasn't
+// been used on this server before.
+func (s *Server) openHandoff(code string) (handoffClaims, bool) {
+	var c handoffClaims
+	p, mac, ok := strings.Cut(code, ".")
+	if !ok || len(code) > 1024 || !hmac.Equal([]byte(mac), []byte(s.Box.MAC(handoffPurp, p))) {
+		return c, false
+	}
+	b, err := base64.RawURLEncoding.DecodeString(p)
+	if err != nil || json.Unmarshal(b, &c) != nil {
+		return c, false
+	}
+	exp := time.Unix(c.Expires, 0)
+	if time.Now().After(exp) {
+		return c, false
+	}
+	key := string(auth.HashToken(code))
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, used := s.handoffs[key]; used {
+		return c, false
+	}
+	s.handoffs[key] = exp // single use, whatever happens next
+	return c, true
 }
 
 // --- the gate (implements proxy.Gate) -----------------------------------
@@ -99,7 +177,21 @@ func (s *Server) Authorize(w http.ResponseWriter, r *http.Request, route *store.
 			proxy.WritePage(w, code, title, msg)
 			return "", nil, false
 		}
-		target := s.signInURL(page, url.Values{"site": {route.Hostname}, "rd": {safeRedirectPath(r.URL.RequestURI())}})
+		q := url.Values{"site": {route.Hostname}, "rd": {safeRedirectPath(r.URL.RequestURI())}}
+		if r.TLS == nil || s.signInURL(page, nil) == "" {
+			proxy.WritePage(w, http.StatusServiceUnavailable, "Sign-in isn't set up",
+				"This site is private, but RyProx doesn't have HTTPS and a sign-in domain yet. An admin can set them under Settings.")
+			return "", nil, false
+		}
+		if page == "login" {
+			st, err := s.browserState(w, r)
+			if err != nil {
+				proxy.WritePage(w, http.StatusInternalServerError, "Sign-in failed", "Something went wrong. Please try again.")
+				return "", nil, false
+			}
+			q.Set("state", st)
+		}
+		target := s.signInURL(page, q)
 		if target == "" {
 			proxy.WritePage(w, http.StatusServiceUnavailable, "Sign-in isn't set up",
 				"This site is private, but RyProx doesn't have a sign-in domain yet. An admin can set one under Settings.")
@@ -224,23 +316,20 @@ func (s *Server) sitePortal(w http.ResponseWriter, r *http.Request, route *store
 
 // handleCallback redeems a one-time code and starts a session for one site.
 func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request, route *store.Route) {
-	code := r.URL.Query().Get("code")
 	rd := safeRedirectPath(r.URL.Query().Get("rd"))
-	key := string(auth.HashToken(code))
-	s.mu.Lock()
-	h, ok := s.handoffs[key]
-	delete(s.handoffs, key) // single use, whatever happens next
-	s.mu.Unlock()
-	if code == "" || !ok || time.Now().After(h.expires) || h.host != route.Hostname || h.ip != clientIP(r) {
-		target := s.signInURL("login", url.Values{"site": {route.Hostname}, "rd": {rd}})
-		if target == "" {
-			proxy.WritePage(w, http.StatusBadRequest, "Sign-in failed", "This sign-in link isn't valid. Please try again.")
-			return
-		}
-		http.Redirect(w, r, target, http.StatusFound)
+	h, ok := s.openHandoff(r.URL.Query().Get("code"))
+	ck, _ := r.Cookie("__Host-" + stateCookie)
+	// The state cookie has done its job either way.
+	http.SetCookie(w, &http.Cookie{Name: "__Host-" + stateCookie, Value: "", Path: "/", MaxAge: -1,
+		HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode})
+	if !ok || h.Host != route.Hostname || ck == nil || !hmac.Equal([]byte(stateHash(ck.Value)), []byte(h.State)) {
+		// No automatic retry: a redirect here could loop for ever (for
+		// example in a browser that blocks cookies).
+		proxy.WriteActionPage(w, http.StatusBadRequest, "Sign-in didn't finish",
+			"This sign-in link has expired, was already used, or was opened in a different browser.", "Try again", rd)
 		return
 	}
-	u, err := s.Store.GetUser(r.Context(), h.userID)
+	u, err := s.Store.GetUser(r.Context(), h.User)
 	if err != nil || u.Disabled || !route.Config.Access.Allows(u.ID) {
 		proxy.WritePage(w, http.StatusForbidden, "No access", "Your account hasn't been given access to this site.")
 		return
@@ -343,6 +432,20 @@ func (s *Server) buildPortal() http.Handler {
 			h(w, r, u, rl)
 		})
 	}
+	// Members change their own password here; admins can also do it on the dashboard.
+	mux.HandleFunc("POST "+p+"api/password", func(w http.ResponseWriter, r *http.Request) {
+		rl, ok := s.portalRealm(r)
+		if !ok {
+			writeError(w, http.StatusNotFound, "not available here")
+			return
+		}
+		u, sess := s.sessionFor(r, rl)
+		if u == nil {
+			writeError(w, http.StatusUnauthorized, "please sign in")
+			return
+		}
+		s.handleChangePassword(w, r, u, sess)
+	})
 	mux.HandleFunc("GET "+p+"api/passkeys", portalUser(s.listPasskeys))
 	mux.HandleFunc("POST "+p+"api/passkeys/begin", inRealm(s.passkeyRegisterBegin))
 	mux.HandleFunc("POST "+p+"api/passkeys/finish", inRealm(s.passkeyRegisterFinish))
@@ -415,10 +518,15 @@ func (s *Server) handlePortalState(w http.ResponseWriter, r *http.Request) {
 // site, if they're signed in on the sign-in domain and allowed there.
 func (s *Server) handleContinue(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		Site string `json:"site"`
-		RD   string `json:"rd"`
+		Site  string `json:"site"`
+		RD    string `json:"rd"`
+		State string `json:"state"`
 	}
 	if !readJSON(w, r, &in) {
+		return
+	}
+	if !stateHashRE.MatchString(in.State) {
+		writeError(w, http.StatusBadRequest, "open the site itself to sign in to it")
 		return
 	}
 	rl, ok := s.portalRealm(r)
@@ -442,14 +550,12 @@ func (s *Server) handleContinue(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusForbidden, map[string]any{"error": "your account hasn't been given access to " + host, "denied": true})
 		return
 	}
-	code, err := auth.NewToken()
+	nonce, err := auth.NewToken()
 	if err != nil {
 		s.writeErr(w, err)
 		return
 	}
-	s.mu.Lock()
-	s.handoffs[string(auth.HashToken(code))] = handoff{userID: u.ID, host: host, ip: clientIP(r), expires: time.Now().Add(handoffTTL)}
-	s.mu.Unlock()
+	code := s.signHandoff(handoffClaims{User: u.ID, Host: host, State: in.State, Expires: time.Now().Add(handoffTTL).Unix(), Nonce: nonce})
 	q := url.Values{"code": {code}, "rd": {safeRedirectPath(in.RD)}}
 	writeJSON(w, http.StatusOK, map[string]string{"url": s.siteURL(host) + proxy.PortalPrefix + "callback?" + q.Encode()})
 }

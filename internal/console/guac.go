@@ -120,9 +120,12 @@ func readRaw(r *bufio.Reader) (string, []string, error) {
 		raw.WriteString(lenStr)
 		var val strings.Builder
 		for i := 0; i < n; i++ {
-			ch, _, err := r.ReadRune()
+			ch, size, err := r.ReadRune()
 			if err != nil {
 				return "", nil, err
+			}
+			if ch == utf8.RuneError && size == 1 {
+				return "", nil, errors.New("malformed instruction")
 			}
 			val.WriteRune(ch)
 		}

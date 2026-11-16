@@ -345,3 +345,26 @@ func TestSSOStateBoundToBrowser(t *testing.T) {
 		t.Fatalf("dashboard sso: %d", code)
 	}
 }
+
+func TestMemberChangesOwnPassword(t *testing.T) {
+	e := newEnv(t)
+	admin := e.client()
+	e.setup(admin)
+	e.enableSignIn()
+	_, _, cookie := e.join(admin, "sam", nil)
+	if rec := e.signInPage("POST", "/.ryprox/api/password", cookie, map[string]string{"current": "nope", "new": "a brand new password"}, visitor); rec.Code != 400 {
+		t.Fatalf("wrong current password: %d", rec.Code)
+	}
+	if rec := e.signInPage("POST", "/.ryprox/api/password", "", map[string]string{"current": memberPW, "new": "a brand new password"}, visitor); rec.Code != 401 {
+		t.Fatalf("no session: %d", rec.Code)
+	}
+	if rec := e.signInPage("POST", "/.ryprox/api/password", cookie, map[string]string{"current": memberPW, "new": "a brand new password"}, visitor); rec.Code != 200 {
+		t.Fatalf("change: %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := e.signInPage("POST", "/.ryprox/api/login", "", map[string]string{"username": "sam", "password": memberPW}, visitor); rec.Code != 401 {
+		t.Fatalf("old password still works: %d", rec.Code)
+	}
+	if rec := e.signInPage("POST", "/.ryprox/api/login", "", map[string]string{"username": "sam", "password": "a brand new password"}, visitor); rec.Code != 200 {
+		t.Fatalf("new password: %d", rec.Code)
+	}
+}

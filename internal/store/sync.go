@@ -94,6 +94,24 @@ func (s *Store) ImportConfig(ctx context.Context, snap Snapshot) error {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	// Sign-in codes already used on this server must stay used.
+	counters := map[int64]int64{}
+	rows, err := tx.QueryContext(ctx, "SELECT id, totp_last_counter FROM users")
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var id, c int64
+		if err := rows.Scan(&id, &c); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		counters[id] = c
+	}
+	_ = rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
 	for i := len(syncTables) - 1; i >= 0; i-- {
 		if _, err := tx.ExecContext(ctx, "DELETE FROM "+syncTables[i]); err != nil { //nolint:gosec // fixed list
 			return err
@@ -139,6 +157,11 @@ func (s *Store) ImportConfig(ctx context.Context, snap Snapshot) error {
 			if _, err := tx.ExecContext(ctx, q, args...); err != nil {
 				return fmt.Errorf("%s: %w", t, err)
 			}
+		}
+	}
+	for id, c := range counters {
+		if _, err := tx.ExecContext(ctx, "UPDATE users SET totp_last_counter = ? WHERE id = ? AND totp_last_counter < ?", c, id, c); err != nil {
+			return err
 		}
 	}
 	if _, err := tx.ExecContext(ctx, "DELETE FROM sessions WHERE user_id NOT IN (SELECT id FROM users)"); err != nil {

@@ -57,9 +57,9 @@ type ssoState struct {
 	nonce    string
 	verifier string
 	cookie   string // hash of the browser-binding cookie
-	ip       string
 	realm    realm
 	site, rd string
+	state    string // the site's browser-state hash, carried through to the handover
 	expires  time.Time
 }
 
@@ -272,6 +272,10 @@ func (s *Server) handleSSOStart(w http.ResponseWriter, r *http.Request) {
 	}
 	verifier := oauth2.GenerateVerifier()
 	q := r.URL.Query()
+	siteState := q.Get("state")
+	if !stateHashRE.MatchString(siteState) {
+		siteState = ""
+	}
 	s.mu.Lock()
 	if s.ssoStates == nil {
 		s.ssoStates = map[string]ssoState{}
@@ -286,8 +290,8 @@ func (s *Server) handleSSOStart(w http.ResponseWriter, r *http.Request) {
 		proxy.WritePage(w, http.StatusServiceUnavailable, "Busy", "Too many sign-ins in progress. Please try again shortly.")
 		return
 	}
-	s.ssoStates[hashHex(state)] = ssoState{provider: p.ID, nonce: nonce, verifier: verifier, cookie: hashHex(bind), ip: clientIP(r),
-		realm: rl, site: proxy.NormalizeHost(q.Get("site")), rd: safeRedirectPath(q.Get("rd")), expires: time.Now().Add(ssoStateTTL)}
+	s.ssoStates[hashHex(state)] = ssoState{provider: p.ID, nonce: nonce, verifier: verifier, cookie: hashHex(bind),
+		realm: rl, site: proxy.NormalizeHost(q.Get("site")), rd: safeRedirectPath(q.Get("rd")), state: siteState, expires: time.Now().Add(ssoStateTTL)}
 	s.mu.Unlock()
 	http.SetCookie(w, &http.Cookie{Name: ssoCookie, Value: bind, Path: "/", Secure: true, HttpOnly: true,
 		SameSite: http.SameSiteLaxMode, MaxAge: int(ssoStateTTL.Seconds())})
@@ -321,7 +325,7 @@ func (s *Server) handleSSOCallback(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 	ck, _ := r.Cookie(ssoCookie)
 	http.SetCookie(w, &http.Cookie{Name: ssoCookie, Value: "", Path: "/", Secure: true, HttpOnly: true, SameSite: http.SameSiteLaxMode, MaxAge: -1})
-	if !found || time.Now().After(st.expires) || st.realm != rl || st.ip != clientIP(r) || ck == nil ||
+	if !found || time.Now().After(st.expires) || st.realm != rl || ck == nil ||
 		subtle.ConstantTimeCompare([]byte(hashHex(ck.Value)), []byte(st.cookie)) != 1 {
 		fail("This sign-in link expired or was opened in a different browser. Please start again.")
 		return
@@ -382,7 +386,7 @@ func (s *Server) handleSSOCallback(w http.ResponseWriter, r *http.Request) {
 	}
 	next := proxy.PortalPrefix + "login"
 	if st.site != "" {
-		next += "?" + url.Values{"site": {st.site}, "rd": {st.rd}}.Encode()
+		next += "?" + url.Values{"site": {st.site}, "rd": {st.rd}, "state": {st.state}}.Encode()
 	}
 	http.Redirect(w, r, next, http.StatusFound)
 }

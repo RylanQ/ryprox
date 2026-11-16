@@ -101,7 +101,9 @@ func (s *Server) relyingParty(r *http.Request) (*webauthn.WebAuthn, error) {
 	})
 }
 
-func (s *Server) putCeremony(key string, c ceremony) {
+// putCeremony remembers a challenge. It returns false when too many are
+// already waiting, so strangers can't fill the server's memory.
+func (s *Server) putCeremony(key string, c ceremony) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.ceremonies == nil {
@@ -113,7 +115,11 @@ func (s *Server) putCeremony(key string, c ceremony) {
 			delete(s.ceremonies, k)
 		}
 	}
+	if _, replacing := s.ceremonies[key]; !replacing && len(s.ceremonies) >= maxCeremonies {
+		return false
+	}
 	s.ceremonies[key] = c
+	return true
 }
 
 // takeCeremony returns and removes a ceremony: each challenge is used once.
@@ -173,7 +179,10 @@ func (s *Server) passkeyRegisterBegin(w http.ResponseWriter, r *http.Request, u 
 		s.writeErr(w, err)
 		return
 	}
-	s.putCeremony(fmt.Sprintf("reg:%d:%s", u.ID, rl.host), ceremony{data: *data, userID: u.ID, realm: rl, ip: clientIP(r), expires: time.Now().Add(passkeyTTL)})
+	if !s.putCeremony(fmt.Sprintf("reg:%d:%s", u.ID, rl.host), ceremony{data: *data, userID: u.ID, realm: rl, ip: clientIP(r), expires: time.Now().Add(passkeyTTL)}) {
+		writeError(w, http.StatusServiceUnavailable, "the server is busy; please try again in a few minutes")
+		return
+	}
 	writeJSON(w, http.StatusOK, opts)
 }
 
@@ -276,7 +285,10 @@ func (s *Server) passkeyLoginBegin(w http.ResponseWriter, r *http.Request, rl re
 		s.writeErr(w, err)
 		return
 	}
-	s.putCeremony("login:"+id, ceremony{data: *data, realm: rl, ip: clientIP(r), expires: time.Now().Add(passkeyTTL)})
+	if !s.putCeremony("login:"+id, ceremony{data: *data, realm: rl, ip: clientIP(r), expires: time.Now().Add(passkeyTTL)}) {
+		writeError(w, http.StatusServiceUnavailable, "the server is busy; please try again in a few minutes")
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"id": id, "options": opts})
 }
 

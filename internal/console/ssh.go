@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"net"
 	"strconv"
@@ -90,6 +91,9 @@ func (s *Service) hostKeyCallback(ctx context.Context, route *store.Route) ssh.H
 				return fmt.Errorf("the server's key changed (now %s); if that's expected, an admin can reset it on the route", got)
 			}
 			return nil
+		}
+		if s.NoLearn {
+			return errors.New("this server hasn't seen the machine's key yet; open the terminal once on the main server, or set the key fingerprint on the route")
 		}
 		known[id] = got // trust on first use
 		b, _ := json.Marshal(known)

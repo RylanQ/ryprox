@@ -32,7 +32,16 @@ func (s *Server) startCrowdSec(ctx context.Context) {
 		return
 	}
 	c, err := s.crowdsecConfig(ctx)
-	if err != nil || !c.Enabled {
+	if err != nil {
+		return
+	}
+	if !c.Enabled {
+		if s.CrowdSec.Status().Enabled {
+			s.mu.Lock()
+			s.crowdsecLive = crowdsec.Config{}
+			s.mu.Unlock()
+			s.CrowdSec.Configure(crowdsec.Config{})
+		}
 		return
 	}
 	key, err := s.Box.Open(c.APIKey, crowdsecSecPurp)
@@ -41,7 +50,13 @@ func (s *Server) startCrowdSec(ctx context.Context) {
 		return
 	}
 	c.APIKey = key
-	s.CrowdSec.Configure(c)
+	s.mu.Lock()
+	same := c == s.crowdsecLive
+	s.crowdsecLive = c
+	s.mu.Unlock()
+	if !same {
+		s.CrowdSec.Configure(c)
+	}
 }
 
 func (s *Server) handleGetCrowdSec(w http.ResponseWriter, r *http.Request, _ *store.User, _ *store.Session) {
@@ -96,6 +111,9 @@ func (s *Server) handlePutCrowdSec(w http.ResponseWriter, r *http.Request, u *st
 		return
 	}
 	if s.CrowdSec != nil {
+		s.mu.Lock()
+		s.crowdsecLive = live
+		s.mu.Unlock()
 		s.CrowdSec.Configure(live)
 	}
 	what := "off"

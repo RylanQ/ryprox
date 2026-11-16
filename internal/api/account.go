@@ -262,6 +262,12 @@ func (s *Server) loginVerify(w http.ResponseWriter, r *http.Request, rl realm, a
 	}
 
 	valid, method := false, "authenticator code"
+	if auth.LooksLikeRecoveryCode(in.Code) && s.Follower != nil {
+		// A code used here would come back at the next copy from the main
+		// server, so it could be used twice.
+		writeJSON(w, http.StatusConflict, apiError{Error: "recovery codes only work on the main server (" + s.Follower.Primary + "); use your authenticator code here", Field: "code"})
+		return
+	}
 	if auth.LooksLikeRecoveryCode(in.Code) {
 		method = "recovery code"
 		valid, err = s.consumeRecoveryCode(r, u.ID, in.Code)

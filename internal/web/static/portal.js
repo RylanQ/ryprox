@@ -167,10 +167,28 @@ function sitesPage() {
          h("ul", { class: "site-list" }, sites.map((s) => h("li", {}, h("a", { href: "https://" + s + "/", class: "mono" }, s))))]
       : h("p", { class: "lede" }, "You haven't been given any sites yet."),
     h("div", { class: "actions" }, h("a", { class: "btn", href: BASE + "logout" }, "Sign out")),
-    h("details", { class: "mt-l" }, h("summary", {}, h("b", {}, "Passkeys")),
+    h("details", { class: "mt-l" }, h("summary", {}, h("b", {}, "Change password")), passwordForm()),
+    h("details", { class: "mt" }, h("summary", {}, h("b", {}, "Passkeys")),
       h("p", { class: "muted" }, "Sign in here with your fingerprint, face or device PIN instead of a password and code."), passkeys()),
     h("details", { class: "mt" }, h("summary", {}, h("b", {}, "Access tokens")),
       h("p", { class: "muted" }, "For scripts and apps that open your sites without a browser. Send the token as Authorization: Bearer <token>."), tokens()));
+}
+
+function passwordForm() {
+  const cur = h("input", { type: "password", autocomplete: "current-password", "data-field": "current" });
+  const nw = h("input", { type: "password", autocomplete: "new-password", "data-field": "new", minlength: 12 });
+  const btn = h("button", { class: "btn", type: "submit" }, "Change password");
+  const form = h("form", { novalidate: true }, field("Current password", cur), field("New password", nw, "At least 12 characters. Your other devices will be signed out."),
+    h("div", { class: "actions" }, btn));
+  form.addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    busy(btn, true, "Saving…");
+    try {
+      await api("password", { current: cur.value, new: nw.value });
+      form.replaceChildren(h("p", {}, "Password changed."));
+    } catch (e) { busy(btn, false); showError(form, e); }
+  });
+  return form;
 }
 
 function passkeys() {

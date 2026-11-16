@@ -193,7 +193,8 @@ function render() {
   if (m) return routeEditor(m[1] === "new" ? null : Number(m[1]));
   if (path === "/certificates") return certificatesPage();
   if (path === "/people") return peoplePage();
-  if (path === "/settings") return settingsPage();
+  if (path === "/settings") return settingsPage(false);
+  if (path === "/account") return settingsPage(true);
   if (path === "/activity") return activityPage();
   if (path === "/import") return importPage();
   if (path === "/sites") return sitesPage();
@@ -219,7 +220,8 @@ function shell(current, ...content) {
         link("#/sites", "Sites", "sites"),
         link("#/certificates", "Certificates", "certs"),
         link("#/activity", "Activity", "activity"),
-        link("#/settings", "Settings", "settings")),
+        link("#/settings", "Settings", "settings"),
+        link("#/account", "My account", "account")),
       h("div", { class: "side-foot" },
         h("div", {}, state.user?.username),
         h("button", { type: "button", onclick: logout }, "Sign out"))),
@@ -780,8 +782,10 @@ async function routeEditor(id) {
     h("section", { class: "section" },
       h("header", {}, h("h2", {}, "Domain")),
       field("Domain name", host, "Point this domain's DNS at this server first."),
-      enabled,
-      h("label", { class: "switch mt" }, kindProxy, h("span", {}, h("b", {}, "Send to services on my network"), h("small", {}, "A normal reverse proxy route."))),
+      enabled),
+    h("section", { class: "section" },
+      h("header", {}, h("h2", {}, "What it does")),
+      h("label", { class: "switch" }, kindProxy, h("span", {}, h("b", {}, "Send to services on my network"), h("small", {}, "A normal reverse proxy route."))),
       h("label", { class: "switch" }, kindRedirect, h("span", {}, h("b", {}, "Redirect to another address"), h("small", {}, "For example www.example.com to example.com."))),
       h("label", { class: "switch" }, kindSSH, h("span", {}, h("b", {}, "Terminal (SSH)"), h("small", {}, "A command line on a server, in the browser."))),
       h("label", { class: "switch" }, kindRDP, h("span", {}, h("b", {}, "Windows desktop (RDP)"), h("small", {}, "Needs guacd; see Settings."))),
@@ -828,6 +832,18 @@ async function routeEditor(id) {
   accessPrivate.addEventListener("change", syncPeople);
   accessPublic.addEventListener("change", syncPeople);
   syncPeople();
+  // Private sites always use HTTPS, whatever the option says.
+  const redirectInput = redirect.querySelector("input");
+  let redirectChoice = redirectInput.checked;
+  redirectInput.addEventListener("change", () => { redirectChoice = redirectInput.checked; });
+  const syncRedirect = () => {
+    redirectInput.disabled = accessPrivate.checked;
+    redirectInput.checked = accessPrivate.checked || redirectChoice;
+    redirect.title = accessPrivate.checked ? "Always on for private sites" : "";
+  };
+  accessPrivate.addEventListener("change", syncRedirect);
+  accessPublic.addEventListener("change", syncRedirect);
+  syncRedirect();
   const syncKind = () => {
     const kind = kindOf();
     redirectSection.hidden = kind !== "redirect";
@@ -835,7 +851,7 @@ async function routeEditor(id) {
     form.querySelectorAll(".proxy-only").forEach((el) => { el.hidden = kind !== "proxy"; });
     const isConsole = !consoleSection.hidden;
     accessPublic.disabled = isConsole;
-    if (isConsole && accessPublic.checked) { accessPrivate.checked = true; syncPeople(); }
+    if (isConsole && accessPublic.checked) { accessPrivate.checked = true; syncPeople(); syncRedirect(); }
     if (isConsole) syncConsole();
   };
   [kindProxy, kindRedirect, kindSSH, kindRDP, kindVNC].forEach((x) => x.addEventListener("change", syncKind));
@@ -949,7 +965,7 @@ async function certificatesPage() {
 }
 
 // ---------- settings ----------
-async function settingsPage() {
+async function settingsPage(account) {
   let s;
   try { s = await api("GET", "/api/settings"); } catch { return; }
 
@@ -1059,8 +1075,21 @@ async function settingsPage() {
   const tokBox = tokensBox("/api/account/tokens", true);
   const ssoBox = ssoEditor();
 
+  if (account) {
+    shell("account",
+      h("div", { class: "page-head" }, h("div", {}, h("h1", {}, "My account"), h("p", { class: "lede" }, `How ${state.user.username} signs in to this dashboard.`))),
+      h("section", { class: "section" }, h("header", {}, h("h2", {}, "Password")), pwForm),
+      h("section", { class: "section" }, h("header", {}, h("h2", {}, "Recovery codes"), h("p", {}, "Use one to sign in if you lose your authenticator app.")), rcForm),
+      h("section", { class: "section" }, h("header", {}, h("h2", {}, "Passkeys"),
+        h("p", {}, "Sign in with your fingerprint, face or device PIN instead of a password and code. A passkey only works on the address it was added on.")), pkBox),
+      h("section", { class: "section" }, h("header", {}, h("h2", {}, "Access tokens"),
+        h("p", {}, "For scripts and apps. A sites token opens your private sites without a browser (send it as Authorization: Bearer <token>). An admin token uses this dashboard's API.")), tokBox),
+      h("section", { class: "section" }, h("header", {}, h("h2", {}, "Signed-in devices")), sessBox));
+    loadSessions();
+    return;
+  }
   shell("settings",
-    h("div", { class: "page-head" }, h("div", {}, h("h1", {}, "Settings"))),
+    h("div", { class: "page-head" }, h("div", {}, h("h1", {}, "Settings"), h("p", { class: "lede" }, "How this RyProx server works. Your own password and passkeys are under My account."))),
     h("section", { class: "section" }, h("header", {}, h("h2", {}, "HTTPS")), httpsForm),
     h("section", { class: "section" }, h("header", {}, h("h2", {}, "Servers"),
       h("p", {}, "Run RyProx on more than one server. Followers copy this server's configuration and certificates and keep serving if it goes down.")), nodesBox),
@@ -1070,15 +1099,7 @@ async function settingsPage() {
       h("p", {}, "Block addresses that CrowdSec has banned, on every site and the sign-in page.")), csBox),
     h("section", { class: "section" }, h("header", {}, h("h2", {}, "Single sign-on"),
       h("p", {}, "Let people sign in to private sites with Google, Microsoft, Authentik or another OpenID Connect provider. Only people whose email you've set on the People page can sign in this way.")), ssoBox),
-    h("section", { class: "section" }, h("header", {}, h("h2", {}, "Password")), pwForm),
-    h("section", { class: "section" }, h("header", {}, h("h2", {}, "Recovery codes"), h("p", {}, "Use one to sign in if you lose your authenticator app.")), rcForm),
-    h("section", { class: "section" }, h("header", {}, h("h2", {}, "Passkeys"),
-      h("p", {}, "Sign in with your fingerprint, face or device PIN instead of a password and code. A passkey only works on the address it was added on.")), pkBox),
-    h("section", { class: "section" }, h("header", {}, h("h2", {}, "Access tokens"),
-      h("p", {}, "For scripts and apps. A sites token opens your private sites without a browser (send it as Authorization: Bearer <token>). An admin token uses this dashboard's API.")), tokBox),
-    h("section", { class: "section" }, h("header", {}, h("h2", {}, "Signed-in devices")), sessBox),
     h("p", { class: "muted" }, `RyProx ${state.version}`));
-  loadSessions();
 }
 
 // ---------- passkeys & tokens (also used on the sign-in page) ----------

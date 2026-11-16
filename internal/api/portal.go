@@ -432,6 +432,20 @@ func (s *Server) buildPortal() http.Handler {
 			h(w, r, u, rl)
 		})
 	}
+	// Members change their own password here; admins can also do it on the dashboard.
+	mux.HandleFunc("POST "+p+"api/password", func(w http.ResponseWriter, r *http.Request) {
+		rl, ok := s.portalRealm(r)
+		if !ok {
+			writeError(w, http.StatusNotFound, "not available here")
+			return
+		}
+		u, sess := s.sessionFor(r, rl)
+		if u == nil {
+			writeError(w, http.StatusUnauthorized, "please sign in")
+			return
+		}
+		s.handleChangePassword(w, r, u, sess)
+	})
 	mux.HandleFunc("GET "+p+"api/passkeys", portalUser(s.listPasskeys))
 	mux.HandleFunc("POST "+p+"api/passkeys/begin", inRealm(s.passkeyRegisterBegin))
 	mux.HandleFunc("POST "+p+"api/passkeys/finish", inRealm(s.passkeyRegisterFinish))

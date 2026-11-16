@@ -204,7 +204,7 @@ func stripRyproxCookies(h http.Header) {
 // "X_Ryprox_User" would otherwise reach them as X-Ryprox-User.
 func stripUnsafeHeaders(h http.Header) {
 	for name := range h {
-		if strings.Contains(name, "_") || strings.HasPrefix(http.CanonicalHeaderKey(name), "X-Ryprox-") {
+		if strings.Contains(name, "_") || strings.HasPrefix(strings.ToLower(name), "x-ryprox-") {
 			delete(h, name)
 		}
 	}

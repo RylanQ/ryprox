@@ -290,3 +290,10 @@ code { font-family: var(--mono); font-size: .85em; background: var(--panel-2); p
 @media (max-width: 640px) { .rule.path-rule, .rule.path-rule.with-site { grid-template-columns: 1fr 1fr; } }
 pre.secret { white-space: pre-wrap; margin: .4rem 0; }
 .actions.end { align-self: end; }
+/* Either/or choices look like radio buttons, not on/off switches. */
+.switch input[type=radio] { width: 20px; height: 20px; border-radius: 50%; background: var(--panel); border: 2px solid var(--line); margin-top: .15rem; }
+.switch input[type=radio]::after { top: 4px; left: 4px; width: 8px; height: 8px; background: transparent; transition: none; }
+.switch input[type=radio]:checked { background: var(--panel); border-color: var(--up); }
+.switch input[type=radio]:checked::after { transform: none; background: var(--up); }
+.switch input:disabled { opacity: .55; cursor: not-allowed; }
+.switch input:focus-visible { outline: 2px solid var(--up); outline-offset: 2px; }
